@@ -117,6 +117,7 @@ class SignupIn(BaseModel):
     password: str = Field(min_length=6)
     name: str
     username: str  # fmail handle -> username@fmails.in
+    code: Optional[str] = None  # OTP code when email verification is enabled
 
 
 class LoginIn(BaseModel):
@@ -137,9 +138,41 @@ class ComposeIn(BaseModel):
     to: str
     subject: str
     body: str
+    cc: Optional[str] = ""
+    bcc: Optional[str] = ""
+    attachments: List[dict] = []  # [{name, type, size, data(base64)}]
     account: Optional[str] = "fmail"
     threadId: Optional[str] = None
+    draftId: Optional[str] = None
     draft: Optional[bool] = False
+
+
+class AiComposeIn(BaseModel):
+    instruction: str
+    tone: str = "Professional"
+    to: Optional[str] = ""
+    context: Optional[str] = ""
+
+
+class OtpRequestIn(BaseModel):
+    email: EmailStr
+    purpose: str = "signup"  # signup | reset
+
+
+class OtpVerifyIn(BaseModel):
+    email: EmailStr
+    code: str
+    purpose: str = "signup"
+
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    code: str
+    password: str = Field(min_length=6)
+
+
+class PermissionsIn(BaseModel):
+    permissions: dict
 
 
 class PatchEmailIn(BaseModel):
@@ -427,7 +460,12 @@ async def signup(body: SignupIn):
         raise HTTPException(400, "An account with this email already exists")
     handle = body.username.lower().strip().replace(" ", "")
     if await db.users.find_one({"handle": handle}):
-        raise HTTPException(400, "This Fmail address is already taken")
+        raise HTTPException(400, "This Fmail address is already taken. Please choose another one.")
+    # Enforce OTP verification when email delivery is configured.
+    if os.environ.get("SMTP_HOST"):
+        if not body.code:
+            raise HTTPException(400, "Please verify your email with the code we sent.")
+        await _verify_code(body.email.lower(), body.code, "signup")
     uid = new_id()
     pw = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
     user = {
@@ -435,13 +473,15 @@ async def signup(body: SignupIn):
         "handle": handle, "fmail": handle + "@fmails.in", "photo": None, "signature": "Sent with Fmail",
         "aliases": [], "connectedAccounts": [
             {"provider": "fmail", "email": handle + "@fmails.in", "connected": True},
-            {"provider": "gmail", "email": body.email.lower(), "connected": True},
+            {"provider": "gmail", "email": "", "connected": False},
             {"provider": "outlook", "email": "", "connected": False},
         ],
+        "permissions": {"notifications": True, "camera": False, "microphone": False, "contacts": False, "storage": False},
         "aiEnabled": True, "memoryEnabled": True, "darkMode": "system",
         "created_at": now_iso(),
     }
     await db.users.insert_one(user)
+    await db.otps.delete_one({"email": body.email.lower(), "purpose": "signup"})
     seed = seed_for(uid, handle, body.name)
     for coll, items in [("emails", seed["emails"]), ("contacts", seed["contacts"]),
                         ("tasks", seed["tasks"]), ("events", seed["events"]),
@@ -480,6 +520,148 @@ async def update_profile(body: ProfileIn, user: dict = Depends(current_user)):
         await db.users.update_one({"id": user["id"]}, {"$set": updates})
     fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password": 0})
     return fresh
+
+
+@api.get("/auth/check-handle")
+async def check_handle(handle: str):
+    """Real-time, case-insensitive availability of a Fmail address (public)."""
+    h = (handle or "").lower().strip().replace(" ", "")
+    if len(h) < 3:
+        return {"available": False, "reason": "Fmail address must be at least 3 characters."}
+    if not all(c.isalnum() or c in "._-" for c in h):
+        return {"available": False, "reason": "Use only letters, numbers, dot, underscore or hyphen."}
+    existing = await db.users.find_one({"handle": h})
+    if existing:
+        return {"available": False, "reason": "This Fmail address is already taken. Please choose another one."}
+    return {"available": True, "handle": h, "fmail": h + "@fmails.in"}
+
+
+@api.put("/auth/permissions")
+async def set_permissions(body: PermissionsIn, user: dict = Depends(current_user)):
+    await db.users.update_one({"id": user["id"]}, {"$set": {"permissions": body.permissions}})
+    await audit(user["id"], "Permissions updated", ", ".join([k for k, v in body.permissions.items() if v]))
+    return await db.users.find_one({"id": user["id"]}, {"_id": 0, "password": 0})
+
+
+@api.delete("/auth/account")
+async def delete_account(user: dict = Depends(current_user)):
+    """Permanently delete the account and ALL associated data."""
+    uid = user["id"]
+    collections = ["emails", "contacts", "tasks", "events", "files", "meetings", "memory",
+                   "spaces", "decisions", "commitments", "followups", "agents", "notifications",
+                   "audit", "ai_cache", "ai_chat", "representative", "otps"]
+    for coll in collections:
+        await db[coll].delete_many({"uid": uid})
+    await db.users.delete_one({"id": uid})
+    logger.info(f"Account permanently deleted: {uid}")
+    return {"ok": True, "deleted": True}
+
+
+# ----------------------------- OTP / email verification -----------------------
+def _gen_code() -> str:
+    import secrets
+    return f"{secrets.randbelow(1000000):06d}"
+
+
+async def _send_email_code(to_email: str, code: str, purpose: str) -> bool:
+    """Deliver an OTP via SMTP if configured. Returns True if actually sent."""
+    host = os.environ.get("SMTP_HOST")
+    if not host:
+        return False
+    import smtplib
+    from email.mime.text import MIMEText
+    port = int(os.environ.get("SMTP_PORT", "587"))
+    smtp_user = os.environ.get("SMTP_USER", "")
+    smtp_pass = os.environ.get("SMTP_PASS", "")
+    sender = os.environ.get("SMTP_FROM", smtp_user or "no-reply@fmails.in")
+    action = "verify your Fmail account" if purpose == "signup" else "reset your Fmail password"
+    msg = MIMEText(f"Your Fmail verification code is {code}. Use it to {action}. It expires in 10 minutes.")
+    msg["Subject"] = f"Fmail code: {code}"
+    msg["From"] = sender
+    msg["To"] = to_email
+    try:
+        with smtplib.SMTP(host, port, timeout=15) as s:
+            s.starttls()
+            if smtp_user:
+                s.login(smtp_user, smtp_pass)
+            s.sendmail(sender, [to_email], msg.as_string())
+        return True
+    except Exception as e:
+        logger.warning(f"SMTP send failed: {e}")
+        return False
+
+
+@api.post("/auth/request-otp")
+async def request_otp(body: OtpRequestIn):
+    email = body.email.lower()
+    if body.purpose == "reset":
+        if not await db.users.find_one({"email": email}):
+            # do not reveal whether an account exists
+            return {"sent": True, "delivered": False}
+    else:
+        if await db.users.find_one({"email": email}):
+            raise HTTPException(400, "An account with this email already exists")
+    existing = await db.otps.find_one({"email": email, "purpose": body.purpose})
+    now = datetime.now(timezone.utc)
+    if existing:
+        last = datetime.fromisoformat(existing["last_sent"])
+        if (now - last).total_seconds() < 30:
+            raise HTTPException(429, "Please wait a few seconds before requesting another code.")
+        if existing.get("send_count", 0) >= 5 and (now - datetime.fromisoformat(existing["created_at"])).total_seconds() < 3600:
+            raise HTTPException(429, "Too many code requests. Please try again later.")
+    code = _gen_code()
+    code_hash = hashlib.sha256(code.encode()).hexdigest()
+    delivered = await _send_email_code(email, code, body.purpose)
+    doc = {
+        "email": email, "purpose": body.purpose, "code_hash": code_hash,
+        "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        "attempts": 0, "verified": False,
+        "send_count": (existing.get("send_count", 0) + 1) if existing else 1,
+        "last_sent": now.isoformat(),
+        "created_at": existing["created_at"] if existing else now.isoformat(),
+    }
+    await db.otps.update_one({"email": email, "purpose": body.purpose}, {"$set": doc}, upsert=True)
+    resp = {"sent": True, "delivered": delivered}
+    if not delivered and os.environ.get("OTP_DEBUG_RETURN") == "1":
+        resp["devCode"] = code  # only for local/dev when no mail provider is configured
+    return resp
+
+
+async def _verify_code(email: str, code: str, purpose: str) -> bool:
+    rec = await db.otps.find_one({"email": email, "purpose": purpose})
+    if not rec:
+        raise HTTPException(400, "Please request a verification code first.")
+    if rec.get("attempts", 0) >= 5:
+        raise HTTPException(429, "Too many incorrect attempts. Please request a new code.")
+    if datetime.now(timezone.utc) > datetime.fromisoformat(rec["expires_at"]):
+        raise HTTPException(400, "This code has expired. Please request a new one.")
+    if hashlib.sha256(code.encode()).hexdigest() != rec["code_hash"]:
+        await db.otps.update_one({"email": email, "purpose": purpose}, {"$inc": {"attempts": 1}})
+        raise HTTPException(400, "Incorrect code. Please check and try again.")
+    await db.otps.update_one({"email": email, "purpose": purpose}, {"$set": {"verified": True}})
+    return True
+
+
+@api.post("/auth/verify-otp")
+async def verify_otp(body: OtpVerifyIn):
+    await _verify_code(body.email.lower(), body.code, body.purpose)
+    return {"verified": True}
+
+
+@api.post("/auth/reset-password")
+async def reset_password(body: ResetPasswordIn):
+    email = body.email.lower()
+    await _verify_code(email, body.code, "reset")
+    user = await db.users.find_one({"email": email})
+    if not user:
+        raise HTTPException(404, "Account not found")
+    pw = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    await db.users.update_one({"id": user["id"]}, {"$set": {"password": pw}})
+    await db.otps.delete_one({"email": email, "purpose": "reset"})
+    await audit(user["id"], "Password reset", "Via verification code")
+    token = make_token(user["id"])
+    user.pop("password"); user.pop("_id", None)
+    return {"token": token, "user": user}
 
 
 # ----------------------------- email routes -----------------------------------
@@ -525,18 +707,35 @@ async def get_thread(tid: str, user: dict = Depends(current_user)):
 @api.post("/emails/compose")
 async def compose(body: ComposeIn, user: dict = Depends(current_user)):
     tid = body.threadId or new_id()
+    # Updating an existing draft? remove the old draft doc first.
+    if body.draftId:
+        await db.emails.delete_one({"uid": user["id"], "id": body.draftId, "folder": "drafts"})
     doc = {
         "id": new_id(), "threadId": tid, "uid": user["id"], "subject": body.subject,
         "sender": user["name"], "senderEmail": user["fmail"], "to": body.to,
+        "cc": body.cc or "", "bcc": body.bcc or "", "attachments": body.attachments or [],
         "account": body.account, "category": "Work", "aiLabel": "FYI", "important": False,
         "unread": False, "star": False, "folder": "drafts" if body.draft else "sent",
-        "snippet": body.body[:120], "body": body.body, "suspicious": False, "space": None,
+        "snippet": (body.body or "")[:120], "body": body.body, "suspicious": False, "space": None,
         "outgoing": True, "created_at": now_iso(),
     }
     await db.emails.insert_one(doc)
     await audit(user["id"], "Draft saved" if body.draft else "Email sent", f"To {body.to}: {body.subject}")
     doc.pop("_id", None)
     return doc
+
+
+@api.delete("/emails/{tid}")
+async def delete_email(tid: str, user: dict = Depends(current_user)):
+    """Move a thread to trash; permanently delete if already in trash."""
+    existing = await db.emails.find_one({"uid": user["id"], "threadId": tid}, {"_id": 0})
+    if not existing:
+        raise HTTPException(404, "Email not found")
+    if existing.get("folder") == "trash":
+        await db.emails.delete_many({"uid": user["id"], "threadId": tid})
+    else:
+        await db.emails.update_many({"uid": user["id"], "threadId": tid}, {"$set": {"folder": "trash"}})
+    return {"ok": True}
 
 
 @api.patch("/emails/{tid}")
@@ -620,6 +819,40 @@ async def ai_reply(body: ReplyIn, user: dict = Depends(current_user)):
     text = await llm_text("You are Fmail's AI reply writer.", prompt, fallback)
     await audit(user["id"], "AI drafted reply", body.action, actor="Fmail AI")
     return {"text": text}
+
+
+TONES = ["Professional", "Friendly", "Short", "Detailed", "Formal", "Casual", "Direct", "Diplomatic"]
+
+
+@api.post("/ai/compose")
+async def ai_compose(body: AiComposeIn, user: dict = Depends(current_user)):
+    """Generate a full email (subject + body) from a plain-language instruction and tone."""
+    tone = body.tone if body.tone in TONES else "Professional"
+    tone_hint = {
+        "Professional": "clear, polished and businesslike",
+        "Friendly": "warm, approachable and personable",
+        "Short": "very concise, a few sentences at most",
+        "Detailed": "thorough, well-structured with all relevant detail",
+        "Formal": "formal, respectful and traditional",
+        "Casual": "relaxed, conversational and informal",
+        "Direct": "straight to the point, no filler",
+        "Diplomatic": "tactful, considerate and balanced",
+    }[tone]
+    prompt = (
+        f"Write an email based on this instruction: {body.instruction}\n"
+        + (f"Recipient: {body.to}\n" if body.to else "")
+        + (f"Additional context:\n{body.context}\n" if body.context else "")
+        + f"Style: {tone_hint}.\n"
+        f"Sign the email as {user['name']}.\n"
+        'Return ONLY minified JSON: {"subject": string, "body": string}. No markdown.'
+    )
+    fallback = {
+        "subject": (body.instruction[:60] or "Message from " + user["name"]),
+        "body": f"Hi,\n\n{body.instruction}\n\nBest,\n{user['name']}",
+    }
+    data = await llm_json("You are Fmail's AI email writer. You draft complete, ready-to-edit emails.", prompt, fallback)
+    await audit(user["id"], "AI drafted email", tone, actor="Fmail AI")
+    return {"subject": data.get("subject", fallback["subject"]), "body": data.get("body", fallback["body"])}
 
 
 @api.post("/ai/ask")
@@ -1006,53 +1239,80 @@ async def set_rep(body: dict, user: dict = Depends(current_user)):
 
 
 # ----------------------------- Sarvam voice -----------------------------------
+class SarvamError(HTTPException):
+    """Maps Sarvam failures to user-friendly messages across 8 error levels."""
+
+
+def _map_sarvam_status(status: int, text: str) -> SarvamError:
+    snippet = (text or "")[:200]
+    if status in (401, 403):
+        return SarvamError(502, "Voice service authentication failed. Please contact support.")
+    if status == 429:
+        return SarvamError(429, "Voice service is busy right now. Please try again in a moment.")
+    if status in (402, 413) or "quota" in snippet.lower() or "limit exceeded" in snippet.lower():
+        return SarvamError(402, "Voice service quota reached. Please try again later.")
+    if 500 <= status < 600:
+        return SarvamError(502, "Voice service is temporarily unavailable. Please try again.")
+    return SarvamError(502, "Voice service returned an error. Please try again.")
+
+
+async def _sarvam_post(path: str, *, headers: dict, retries: int = 2, **kwargs) -> dict:
+    """POST to Sarvam with retry + full 8-level error handling."""
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=45) as c:
+                r = await c.post("https://api.sarvam.ai" + path, headers=headers, **kwargs)
+        except httpx.TimeoutException:
+            last_exc = SarvamError(504, "Voice request timed out. Please check your connection and try again.")
+        except httpx.TransportError:
+            last_exc = SarvamError(503, "Network problem reaching the voice service. Please check your connection.")
+        except Exception as e:
+            logger.warning(f"sarvam unexpected {path}: {e}")
+            last_exc = SarvamError(502, "Something went wrong with the voice service. Please try again.")
+        else:
+            if r.status_code < 400:
+                try:
+                    return r.json()
+                except Exception:
+                    raise SarvamError(502, "Voice service returned an unexpected response. Please try again.")
+            logger.warning(f"sarvam {path} {r.status_code}: {r.text[:200]}")
+            err = _map_sarvam_status(r.status_code, r.text)
+            # only retry transient errors (429 / 5xx)
+            if r.status_code not in (429,) and not (500 <= r.status_code < 600):
+                raise err
+            last_exc = err
+        if attempt < retries:
+            import asyncio
+            await asyncio.sleep(0.6 * (attempt + 1))
+    raise last_exc or SarvamError(502, "Voice service failed. Please try again.")
+
+
 @api.post("/voice/transcribe")
 async def transcribe(file: UploadFile = File(...), language_code: str = Form("hi-IN"),
                      mode: str = Form("codemix"), user: dict = Depends(current_user)):
     if not SARVAM_API_KEY:
-        raise HTTPException(503, "Voice transcription is not configured")
+        raise HTTPException(503, "Voice transcription is not configured.")
     data = await file.read()
     if not data:
-        raise HTTPException(413, "Empty audio")
+        raise HTTPException(413, "The recording was empty. Please try again.")
     form = {"language_code": language_code, "mode": mode, "model": "saaras:v3"}
     files = {"file": (file.filename or "audio.m4a", data, file.content_type or "audio/mp4")}
-    try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            r = await c.post("https://api.sarvam.ai/speech-to-text",
-                             headers={"api-subscription-key": SARVAM_API_KEY}, data=form, files=files)
-        if r.status_code >= 400:
-            logger.warning(f"sarvam stt {r.status_code}: {r.text[:200]}")
-            raise HTTPException(502, "Transcription service error")
-        return r.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"sarvam stt failed: {e}")
-        raise HTTPException(502, "Transcription failed")
+    return await _sarvam_post("/speech-to-text",
+                              headers={"api-subscription-key": SARVAM_API_KEY}, data=form, files=files)
 
 
 @api.post("/translate")
 async def translate(body: TranslateIn, user: dict = Depends(current_user)):
     if not SARVAM_API_KEY:
-        raise HTTPException(503, "Translation is not configured")
+        raise HTTPException(503, "Translation is not configured.")
     if body.source == body.target:
-        raise HTTPException(400, "Source and target languages must differ")
+        raise HTTPException(400, "Source and target languages must differ.")
     payload = {"input": body.text, "source_language_code": body.source,
                "target_language_code": body.target, "model": "mayura:v1", "mode": "modern-colloquial"}
-    try:
-        async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post("https://api.sarvam.ai/translate",
-                             headers={"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"},
-                             json=payload)
-        if r.status_code >= 400:
-            logger.warning(f"sarvam translate {r.status_code}: {r.text[:200]}")
-            raise HTTPException(502, "Translation service error")
-        return r.json()
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(f"sarvam translate failed: {e}")
-        raise HTTPException(502, "Translation failed")
+    return await _sarvam_post("/translate",
+                              headers={"api-subscription-key": SARVAM_API_KEY, "Content-Type": "application/json"},
+                              json=payload)
 
 
 # ----------------------------- search -----------------------------------------

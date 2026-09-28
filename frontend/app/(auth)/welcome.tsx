@@ -1,8 +1,8 @@
 import React from "react";
 import { View, Text, ScrollView } from "react-native";
+import { Image } from "expo-image";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { LinearGradient } from "expo-linear-gradient";
 import { useTheme, spacing, radius } from "@/src/theme";
 import { Icon, Button, T } from "@/src/ui";
 
@@ -21,9 +21,7 @@ export default function Welcome() {
     <View style={{ flex: 1, backgroundColor: colors.surface }}>
       <ScrollView contentContainerStyle={{ paddingTop: insets.top + 40, paddingBottom: insets.bottom + 24, paddingHorizontal: spacing.xl }}>
         <View style={{ alignItems: "center", marginBottom: 28 }}>
-          <LinearGradient colors={[colors.brandPrimary, colors.brandSecondary]} style={{ width: 76, height: 76, borderRadius: 22, alignItems: "center", justifyContent: "center" }}>
-            <Icon name="at" size={44} color="#fff" />
-          </LinearGradient>
+          <Image source={require("@/assets/images/icon.png")} style={{ width: 84, height: 84, borderRadius: 22 }} contentFit="cover" />
           <Text style={{ fontSize: 40, fontWeight: "900", color: colors.onSurface, marginTop: 18, letterSpacing: -1 }}>Fmail</Text>
           <Text style={{ fontSize: 16, color: colors.muted, marginTop: 6, textAlign: "center" }}>Your Communication. Your Intelligence. Your AI.</Text>
         </View>

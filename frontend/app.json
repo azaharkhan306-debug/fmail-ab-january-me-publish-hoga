@@ -9,7 +9,7 @@
     "userInterfaceStyle": "automatic",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.emergent.fmailaios.cw0z92",
+      "bundleIdentifier": "in.fmail.app",
       "infoPlist": {
         "NSMicrophoneUsageDescription": "Dictate emails and join meetings with audio",
         "NSCameraUsageDescription": "Use your camera in Fmail Meet video calls"
@@ -20,7 +20,7 @@
         "foregroundImage": "./assets/images/adaptive-icon.png",
         "backgroundColor": "#FF5E00"
       },
-      "package": "com.emergent.fmailaios.cw0z92",
+      "package": "in.fmail.app",
       "permissions": [
         "RECORD_AUDIO",
         "CAMERA"

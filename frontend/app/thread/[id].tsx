@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { View, Text, ScrollView, Pressable } from "react-native";
+import { View, Text, ScrollView, Pressable, Alert } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -43,11 +43,20 @@ export default function Thread() {
   const genReply = useMutation({
     mutationFn: (action: string) => api.post("/ai/reply", { threadId: id, tone, action, draft }),
     onSuccess: (r) => setDraft(r.text),
+    onError: (e: any) => Alert.alert("AI Reply", e?.message || "Couldn't generate a reply. Please try again."),
   });
   const sendReply = useMutation({
     mutationFn: () => api.post("/emails/compose", { to: data?.messages?.[0]?.senderEmail, subject: "Re: " + data?.subject, body: draft, threadId: id }),
-    onSuccess: () => { setReplyOpen(false); setDraft(""); qc.invalidateQueries({ queryKey: ["emails"] }); refetch(); },
+    onSuccess: () => { setReplyOpen(false); setDraft(""); qc.invalidateQueries({ queryKey: ["emails"] }); refetch(); Alert.alert("Fmail", "Reply sent."); },
+    onError: (e: any) => Alert.alert("Fmail", e?.message || "Couldn't send the reply. Please try again."),
   });
+  const forward = () => {
+    const m = data?.messages?.[data.messages.length - 1];
+    router.push({ pathname: "/compose", params: {
+      subject: "Fwd: " + (data?.subject || ""),
+      body: `\n\n---------- Forwarded message ----------\nFrom: ${m?.sender} <${m?.senderEmail}>\n\n${m?.body || ""}`,
+    } });
+  };
 
   if (isLoading) return <View style={{ flex: 1, backgroundColor: colors.surface }}><Header title="Loading…" back showSearch={false} /><Loading /></View>;
   if (isError || !data) return <View style={{ flex: 1, backgroundColor: colors.surface }}><Header title="Error" back showSearch={false} /><ErrorState onRetry={refetch} /></View>;
@@ -139,6 +148,8 @@ export default function Thread() {
         <T size={13} weight="800" color={colors.muted} style={{ marginTop: 16, marginBottom: 8 }}>SMART ACTIONS</T>
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <ActionChip icon="reply" label="AI Reply" onPress={() => setReplyOpen(true)} testID="action-reply" />
+          <ActionChip icon="pencil-outline" label="Reply" onPress={() => router.push({ pathname: "/compose", params: { to: data.messages[0]?.senderEmail, subject: "Re: " + data.subject, threadId: id } })} testID="action-reply-manual" />
+          <ActionChip icon="share-outline" label="Forward" onPress={forward} testID="action-forward" />
           <ActionChip icon="checkbox-marked-circle-plus-outline" label="To Task" onPress={() => toTask.mutate()} loading={toTask.isPending} testID="action-task" />
           <ActionChip icon="calendar-plus" label="Schedule Meeting" onPress={() => router.push({ pathname: "/calendar", params: { new: data.subject } })} testID="action-meeting" />
           <ActionChip icon="bell-plus-outline" label="Remind" onPress={() => toTask.mutate()} testID="action-remind" />

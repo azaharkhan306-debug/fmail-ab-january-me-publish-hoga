@@ -47,7 +47,11 @@ export default function Login() {
 
         <Button title="Sign in" onPress={onLogin} loading={loading} testID="login-submit" style={{ marginTop: 24 }} />
 
-        <Pressable onPress={() => router.replace("/(auth)/signup")} style={{ marginTop: 20, alignItems: "center" }} testID="go-signup">
+        <Pressable onPress={() => router.push("/(auth)/forgot")} style={{ marginTop: 16, alignItems: "center" }} testID="go-forgot">
+          <T color={colors.brandPrimary} weight="700">Forgot password?</T>
+        </Pressable>
+
+        <Pressable onPress={() => router.replace("/(auth)/signup")} style={{ marginTop: 16, alignItems: "center" }} testID="go-signup">
           <T color={colors.muted}>New to Fmail? <Text style={{ color: colors.brandPrimary, fontWeight: "700" }}>Create identity</Text></T>
         </Pressable>
       </KeyboardAwareScrollView>

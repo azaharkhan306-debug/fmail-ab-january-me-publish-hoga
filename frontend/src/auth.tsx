@@ -1,6 +1,9 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { api, setToken, clearToken, getToken } from "@/src/api";
+import { storage } from "@/src/utils/storage";
 import "@/src/firebase"; // ensure Firebase app is initialized app-wide
+
+const USER_KEY = "fmail_user";
 
 type User = {
   id: string; email: string; name: string; handle: string; fmail: string;
@@ -12,7 +15,7 @@ type AuthCtx = {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (email: string, password: string, name: string, username: string) => Promise<void>;
+  signup: (email: string, password: string, name: string, username: string, code?: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   setUser: (u: User) => void;
@@ -22,8 +25,14 @@ const Ctx = createContext<AuthCtx>(null as any);
 export const useAuth = () => useContext(Ctx);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
+  const [user, setUserState] = useState<User | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const setUser = useCallback((u: User | null) => {
+    setUserState(u);
+    if (u) storage.setItem(USER_KEY, JSON.stringify(u));
+    else storage.removeItem(USER_KEY);
+  }, []);
 
   const bootstrap = useCallback(async () => {
     const token = await getToken();
@@ -31,15 +40,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setLoading(false);
       return;
     }
+    // Instant open: hydrate cached user immediately, verify in background.
+    const cached = await storage.getItem<string>(USER_KEY, "");
+    if (cached) {
+      try { setUserState(JSON.parse(cached)); } catch {}
+      setLoading(false);
+    }
     try {
       const me = await api.get("/auth/me");
       setUser(me);
     } catch {
-      await clearToken();
+      if (!cached) await clearToken();
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setUser]);
 
   useEffect(() => {
     bootstrap();
@@ -51,8 +66,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(res.user);
   };
 
-  const signup = async (email: string, password: string, name: string, username: string) => {
-    const res = await api.post("/auth/signup", { email, password, name, username });
+  const signup = async (email: string, password: string, name: string, username: string, code?: string) => {
+    const res = await api.post("/auth/signup", { email, password, name, username, code });
     await setToken(res.token);
     setUser(res.user);
   };

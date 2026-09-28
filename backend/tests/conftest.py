@@ -1,6 +1,6 @@
 import os, uuid, pytest, requests
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://fmail-ai-os.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://run-mobile-app-6.preview.emergentagent.com").rstrip("/")
 
 @pytest.fixture(scope="session")
 def base_url():

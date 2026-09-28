@@ -21,7 +21,10 @@
         "backgroundColor": "#FF5E00"
       },
       "package": "com.emergent.fmailaios.cw0z92",
-      "permissions": ["RECORD_AUDIO", "CAMERA"]
+      "permissions": [
+        "RECORD_AUDIO",
+        "CAMERA"
+      ]
     },
     "web": {
       "bundler": "metro",
@@ -47,7 +50,9 @@
       "expo-audio",
       [
         "expo-camera",
-        { "cameraPermission": "Use your camera in Fmail Meet video calls" }
+        {
+          "cameraPermission": "Use your camera in Fmail Meet video calls"
+        }
       ]
     ],
     "experiments": {

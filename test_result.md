@@ -342,3 +342,55 @@ agent_communication:
 agent_communication:
     - agent: "main"
       message: "Backend verification passed 18/18. Expo restarted; frontend/mobile agent may now verify startup, auth, legal/feedback routes, Google configuration guard, meeting share/copy controls, attachment UI, photo display, keyboard-safe forms, and absence of Share App/debug OTP. Native-only notification/Google/analytics flows must be reported as credential/build gated if not runnable in preview."
+
+
+# Pre-OTP-provider full regression requested by user
+backend:
+  - task: "Complete backend regression with email/OTP provider disabled"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Before configuring Emergent.sh OTP delivery, verify existing auth, email, files, meetings, settings-backed APIs, AI, Sarvam, failure handling, and disabled-email fail-closed behavior."
+        - working: true
+          agent: "testing"
+          comment: "✅ COMPREHENSIVE BACKEND REGRESSION COMPLETE - ALL 137 TESTS PASSED. Tested all route groups with success and failure cases: (1) Root/health - GET / returns 200 with status=ok. (2) OTP fail-closed - request-otp returns 503 with safe message when Resend not configured, NO devCode/test OTP exposed in any response (security verified), signup requires valid OTP code and returns 400 with verification error. (3) Verify/reset - verify-otp without request returns 400, reset-password with invalid code returns 400, OTP cooldown enforced (429 or 503). (4) Login/me/session - demo@fmail.com / demo123 login works and returns token+user, wrong password returns 401, /auth/me with valid token returns user data without password field, invalid token returns 401, no token returns 401/403. (5) Handle availability - 'demo' is taken (case-insensitive), unique handles available, min length (3 chars) and invalid chars validation working. (6) Profile update - PUT /auth/profile updates name correctly. (7) Permissions - PUT /auth/permissions stores and returns updated permissions. (8) Delete account safety - requires authentication (401/403 without token). (9) Inbox folders/filters - all folders work (inbox/sent/drafts/trash/important), filter=unread works, all return arrays. (10) Thread read - GET /threads/{tid} returns messages, invalid thread returns 404. (11) Compose/draft/delete/trash with Cc/Bcc/attachments - compose stores cc/bcc/attachments correctly and sets folder=sent, draft sets folder=drafts and appears in drafts list, DELETE first time moves to trash, DELETE second time permanently removes, PATCH updates star/important fields. (12) AI endpoints - compose returns subject+body, reply returns text, understand returns intent, thread returns summary, ask returns answer, chat-history returns array, email-to-task creates task with title, file-summary returns summary. All AI endpoints working with Emergent LLM. (13) Dashboard - returns brief/counts/tasks correctly. (14) Tasks/events/contacts/files CRUD - all GET/POST/DELETE operations work, file upload validates size (413 for >8MB), download returns 404 for invalid/other users' files (security verified). (15) Memory/spaces/decisions/commitments/followups/audit/notifications - all GET endpoints return 200, POST /memory works. (16) Meetings - create/get/share/notes/ask all work, share returns URL with APP_URL configured. (17) Agents/representative - marketplace returns array, install/toggle/delete work, representative GET/PUT work. (18) Voice/translation - transcribe with empty audio returns friendly 413 error, translate works with Sarvam API (returns translated text), source==target validation returns 400. (19) Google/Gmail/FCM/analytics/feedback - google/config returns configured status, authorize returns safe 503 error when not configured, gmail/sync returns safe 400 error, push/register validates token length (422 for short) and registers valid tokens, analytics records events, feedback returns safe 503 when Resend not configured. (20) Network/invalid-auth/validation - invalid token returns 401, missing required fields returns 422, search returns multiple categories. Backend logs clean - no crashes, current server process running without errors (uptime 37+ minutes). Security verified: NO API keys, private keys, OTP codes, devCode, or test OTP exposed in any response. All endpoints fail-closed with user-safe messages when credentials unavailable. All 137 backend tests passed with zero failures."
+frontend:
+  - task: "Complete app end-to-end regression with email/OTP provider disabled"
+    implemented: true
+    working: "NA"
+    file: "multiple"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Before configuring Emergent.sh OTP delivery, verify every screen, button, navigation path, form, keyboard behavior, attachments, meetings, settings, legal/feedback flows, and recovery states."
+metadata:
+  test_sequence: 9
+  run_ui: true
+test_plan:
+  current_focus:
+    - "Complete backend regression with Resend/OTP email sending disabled"
+    - "Complete mobile/web UI regression across all screens and interactions"
+  stuck_tasks: []
+  test_all: true
+  test_priority: "high_first"
+agent_communication:
+    - agent: "main"
+      message: "Do not configure OTP delivery yet. Run full end-to-end regression first with missing email provider credentials; no test OTPs may be generated or exposed."
+    - agent: "testing"
+      message: "✅ BACKEND REGRESSION COMPLETE - ALL 137 TESTS PASSED. Comprehensive testing of all route groups completed successfully. All endpoints working correctly with proper fail-closed behavior when credentials unavailable. Security verified: NO sensitive data (API keys, OTP codes, devCode) exposed. Backend logs clean with no crashes. Server running stable (37+ min uptime). Demo account demo@fmail.com / demo123 working. All AI endpoints (compose/reply/understand/ask/email-to-task/file-summary) working with Emergent LLM. Sarvam voice/translation working. All CRUD operations (tasks/events/contacts/files/memory/meetings/agents) working. Email compose with Cc/Bcc/attachments, draft/delete/trash all working. OTP fail-closed verified - returns 503 with safe message, no test codes exposed. Frontend testing NOT performed as per instructions (backend only)."
+
+
+
+# Frontend regression may proceed because user explicitly requested complete end-to-end verification
+agent_communication:
+    - agent: "main"
+      message: "Backend 137/137 passed. Expo frontend regression is authorized by the user's explicit request; verify every screen and interaction before any OTP-provider configuration."

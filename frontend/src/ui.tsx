@@ -1,7 +1,7 @@
 import React from "react";
 import {
   View, Text, Pressable, ActivityIndicator, ScrollView, TextInput,
-  Modal, StyleProp, ViewStyle, TextStyle, Platform,
+  Modal, StyleProp, ViewStyle, TextStyle, Platform, Image, KeyboardAvoidingView, Keyboard,
 } from "react-native";
 import MDIcon from "@react-native-vector-icons/material-design-icons";
 import { useTheme, makeStyles, spacing, radius, ThemeColors } from "@/src/theme";
@@ -103,8 +103,8 @@ export function Avatar({ name, size = 42, uri }: { name: string; size?: number; 
   const palette = ["#FF5E00", "#2F6FED", "#1E9E5A", "#C98A00", "#9A6BFF", "#D64545"];
   const bg = palette[(name?.charCodeAt(0) || 0) % palette.length];
   return (
-    <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: bg, alignItems: "center", justifyContent: "center" }}>
-      <Text style={{ color: "#fff", fontWeight: "700", fontSize: size * 0.38 }}>{initials}</Text>
+    <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: bg, alignItems: "center", justifyContent: "center", overflow: "hidden" }}>
+      {uri ? <Image source={{ uri }} style={{ width: size, height: size }} resizeMode="cover" /> : <Text style={{ color: "#fff", fontWeight: "700", fontSize: size * 0.38 }}>{initials}</Text>}
     </View>
   );
 }
@@ -182,9 +182,11 @@ export function Sheet({ visible, onClose, children, title, testID }:
               <Pressable onPress={onClose} testID="sheet-close"><Icon name="close" size={24} color={colors.muted} /></Pressable>
             </View>
           ) : null}
-          <ScrollView style={{ paddingHorizontal: spacing.lg }} contentContainerStyle={{ paddingBottom: 20 }} keyboardShouldPersistTaps="handled">
-            {children}
-          </ScrollView>
+          <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"}>
+            <ScrollView style={{ paddingHorizontal: spacing.lg }} contentContainerStyle={{ paddingBottom: 20 }} keyboardShouldPersistTaps="handled" keyboardDismissMode="interactive">
+              {children}
+            </ScrollView>
+          </KeyboardAvoidingView>
         </Pressable>
       </Pressable>
     </Modal>

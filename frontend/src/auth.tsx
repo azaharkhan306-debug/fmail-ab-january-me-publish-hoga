@@ -1,6 +1,8 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
 import { api, setToken, clearToken, getToken } from "@/src/api";
 import { storage } from "@/src/utils/storage";
+import { track } from "@/src/analytics";
+import { registerDeviceForPush } from "@/src/notifications";
 import "@/src/firebase"; // ensure Firebase app is initialized app-wide
 
 const USER_KEY = "fmail_user";
@@ -30,7 +32,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const setUser = useCallback((u: User | null) => {
     setUserState(u);
-    if (u) storage.setItem(USER_KEY, JSON.stringify(u));
+    if (u) { storage.setItem(USER_KEY, JSON.stringify(u)); registerDeviceForPush(); }
     else storage.removeItem(USER_KEY);
   }, []);
 
@@ -64,12 +66,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const res = await api.post("/auth/login", { email, password });
     await setToken(res.token);
     setUser(res.user);
+    await track("login");
   };
 
   const signup = async (email: string, password: string, name: string, username: string, code?: string) => {
     const res = await api.post("/auth/signup", { email, password, name, username, code });
     await setToken(res.token);
     setUser(res.user);
+    await track("signup");
   };
 
   const logout = async () => {

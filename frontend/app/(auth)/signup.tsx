@@ -60,8 +60,7 @@ export default function Signup() {
       setStep("otp");
       setCooldown(30);
       if (r.delivered) setInfo(`We sent a 6-digit code to ${email.trim()}.`);
-      else if (r.devCode) { setCode(r.devCode); setInfo("Email delivery isn't configured yet — your code is pre-filled for testing."); }
-      else setInfo("Enter the verification code to continue.");
+      else setInfo("If an account exists, a verification email was sent.");
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -74,8 +73,7 @@ export default function Signup() {
     try {
       const r = await api.post("/auth/request-otp", { email: email.trim(), purpose: "signup" });
       setCooldown(30);
-      if (r.devCode) setCode(r.devCode);
-      setInfo(r.delivered ? "A new code was sent." : "A new code was generated.");
+      setInfo(r.delivered ? "A new code was sent." : "If an account exists, a new verification email was sent.");
     } catch (e: any) { setError(e.message); }
   };
 

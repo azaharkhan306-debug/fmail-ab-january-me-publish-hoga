@@ -53,7 +53,10 @@
         {
           "cameraPermission": "Use your camera in Fmail Meet video calls"
         }
-      ]
+      ],
+      "@react-native-firebase/app",
+      "@react-native-firebase/messaging",
+      "@react-native-firebase/analytics"
     ],
     "experiments": {
       "typedRoutes": true

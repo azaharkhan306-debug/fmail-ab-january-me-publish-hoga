@@ -3,6 +3,7 @@ import { View, Text, FlatList, Pressable } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 import { api } from "@/src/api";
 import { useTheme, spacing, radius } from "@/src/theme";
 import { Icon, T, Card, Button, Loading, ErrorState, Empty, Sheet } from "@/src/ui";
@@ -31,6 +32,7 @@ export default function Files() {
       form.append("name", a.name);
       form.append("type", a.mimeType?.includes("pdf") ? "pdf" : a.mimeType?.includes("image") ? "image" : "document");
       form.append("size", a.size ? `${Math.round(a.size / 1024)} KB` : "");
+      form.append("data", await FileSystem.readAsStringAsync(a.uri, { encoding: "base64" }));
       await api.upload("/files", form);
       qc.invalidateQueries({ queryKey: ["files"] });
     } catch {}

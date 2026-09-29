@@ -1,5 +1,5 @@
 import React from "react";
-import { View, Text, ScrollView } from "react-native";
+import { View, Text, ScrollView, Pressable } from "react-native";
 import { Image } from "expo-image";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
@@ -41,7 +41,11 @@ export default function Welcome() {
         </View>
 
         <Button title="Create your Fmail identity" icon="rocket-launch-outline" testID="welcome-signup" onPress={() => router.push("/(auth)/signup")} />
-        <Button title="I already have an account" variant="ghost" testID="welcome-login" onPress={() => router.push("/(auth)/login")} style={{ marginTop: 8 }} />
+        <Pressable onPress={() => router.push("/(auth)/login")} style={{ marginTop: 16, alignItems: "center" }} testID="welcome-login">
+          <T color={colors.muted}>I already have an account</T>
+        </Pressable>
+        <Pressable onPress={() => router.push("/terms")} style={{ marginTop: 18, alignItems: "center" }} testID="welcome-terms"><T size={12} color={colors.muted}>Terms & Conditions</T></Pressable>
+        <Pressable onPress={() => router.push("/privacy")} style={{ marginTop: 8, alignItems: "center" }} testID="welcome-privacy"><T size={12} color={colors.muted}>Privacy Policy</T></Pressable>
       </ScrollView>
     </View>
   );

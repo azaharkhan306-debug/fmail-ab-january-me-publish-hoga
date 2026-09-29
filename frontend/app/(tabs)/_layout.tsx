@@ -10,7 +10,7 @@ export default function TabsLayout() {
   const { user, loading } = useAuth();
   const { colors } = useTheme();
 
-  if (loading) return <View style={{ flex: 1, backgroundColor: colors.surface }}><Loading /></View>;
+  if (loading) return null;
   if (!user) return <Redirect href="/(auth)/welcome" />;
 
   return (

@@ -1,8 +1,10 @@
 import React, { useState } from "react";
-import { View, Text, Pressable } from "react-native";
+import { View, Text, Pressable, Alert, Platform } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
+import { api, setToken } from "@/src/api";
+import { track } from "@/src/analytics";
 import { useAuth } from "@/src/auth";
 import { useTheme, spacing } from "@/src/theme";
 import { Icon, Button, Field, T } from "@/src/ui";
@@ -46,6 +48,7 @@ export default function Login() {
         {error ? <Text style={{ color: colors.error, marginTop: 12 }} testID="login-error">{error}</Text> : null}
 
         <Button title="Sign in" onPress={onLogin} loading={loading} testID="login-submit" style={{ marginTop: 24 }} />
+        <GoogleAuthButton />
 
         <Pressable onPress={() => router.push("/(auth)/forgot")} style={{ marginTop: 16, alignItems: "center" }} testID="go-forgot">
           <T color={colors.brandPrimary} weight="700">Forgot password?</T>
@@ -56,5 +59,20 @@ export default function Login() {
         </Pressable>
       </KeyboardAwareScrollView>
     </View>
+  );
+}
+
+function GoogleAuthButton() {
+  // Google sign-in is not configured for this Fmail project
+  // Show safe message when clicked
+  return (
+    <Button 
+      title="Continue with Google" 
+      icon="google" 
+      variant="secondary" 
+      onPress={() => Alert.alert("Google sign-in unavailable", "Google OAuth is not configured for the Fmail Firebase project yet.")} 
+      style={{ marginTop: 12 }} 
+      testID="google-signin" 
+    />
   );
 }

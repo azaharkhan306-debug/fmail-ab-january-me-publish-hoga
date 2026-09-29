@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { View, Text, ScrollView, Pressable, Alert } from "react-native";
+import { Alert, View, Text, ScrollView, Pressable } from "react-native";
 import * as ImagePicker from "expo-image-picker";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
@@ -21,6 +21,7 @@ export default function Settings() {
   const [editOpen, setEditOpen] = useState(false);
   const [name, setName] = useState(user?.name || "");
   const [sig, setSig] = useState(user?.signature || "");
+  const [photoError, setPhotoError] = useState("");
   const [busy, setBusy] = useState(false);
 
   const update = async (b: any) => {
@@ -34,6 +35,7 @@ export default function Settings() {
 
   const changePhoto = async () => {
     try {
+      setPhotoError("");
       const perm = await ImagePicker.requestMediaLibraryPermissionsAsync();
       if (!perm.granted) return Alert.alert("Permission needed", "Please allow photo access to set a profile picture.");
       const res = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ["images"], allowsEditing: true, aspect: [1, 1], quality: 0.6, base64: true });
@@ -42,8 +44,9 @@ export default function Settings() {
       if (!b64) return Alert.alert("Fmail", "Couldn't read that image. Please try another.");
       setBusy(true);
       await update({ photo: `data:image/jpeg;base64,${b64}` });
-    } catch {
-      Alert.alert("Fmail", "Couldn't update your photo. Please try again.");
+    } catch (e: any) {
+      setPhotoError(e?.message || "Couldn't update your photo. Please try again.");
+      Alert.alert("Fmail", e?.message || "Couldn't update your photo. Please try again.");
     } finally { setBusy(false); }
   };
 
@@ -80,6 +83,7 @@ export default function Settings() {
             </View>
           </Pressable>
           <T size={20} weight="800" style={{ marginTop: 12 }}>{user?.name}</T>
+          {photoError ? <T size={12} color={colors.error} style={{ marginTop: 6 }}>{photoError}</T> : null}
           <View style={{ backgroundColor: colors.brandTertiary, paddingHorizontal: 12, paddingVertical: 5, borderRadius: radius.pill, marginTop: 6 }}>
             <Text style={{ color: colors.onBrandTertiary, fontWeight: "700" }}>{user?.fmail}</Text>
           </View>
@@ -138,6 +142,14 @@ export default function Settings() {
             <T size={14} style={{ flex: 1 }}>Cloud sync</T>
             <Badge label="Encrypted (TLS)" color={colors.success} tone="soft" />
           </View>
+        </Card>
+
+        <SectionTitle text="SUPPORT & LEGAL" />
+        <Card style={{ marginBottom: 16, paddingVertical: 4 }}>
+          <Row icon="email-fast-outline" label="Connect Gmail" onPress={() => router.push("/gmail")} testID="nav-gmail" />
+          <Row icon="message-text-outline" label="Send feedback" onPress={() => router.push("/feedback")} testID="nav-feedback" />
+          <Row icon="file-document-outline" label="Terms & Conditions" onPress={() => router.push("/terms")} testID="nav-terms" />
+          <Row icon="shield-lock-outline" label="Privacy Policy" onPress={() => router.push("/privacy")} testID="nav-privacy" last />
         </Card>
 
         <SectionTitle text="ACCOUNT" />

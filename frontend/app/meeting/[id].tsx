@@ -1,5 +1,6 @@
 import React, { useState } from "react";
-import { View, Text, ScrollView, Pressable } from "react-native";
+import { View, Text, ScrollView, Pressable, Alert, Share } from "react-native";
+import * as Clipboard from "expo-clipboard";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
@@ -21,8 +22,28 @@ export default function Meeting() {
   const [askOpen, setAskOpen] = useState(false);
   const [q, setQ] = useState("");
   const [ans, setAns] = useState("");
+  const [meetingUrl, setMeetingUrl] = useState("");
+  const [shareBusy, setShareBusy] = useState(false);
 
   const { data, isLoading, isError, refetch } = useQuery({ queryKey: ["meeting", id], queryFn: () => api.get(`/meetings/${id}`) });
+
+  const shareMeeting = async () => {
+    setShareBusy(true);
+    try {
+      const response = meetingUrl ? { url: meetingUrl } : await api.post(`/meetings/${id}/share`);
+      setMeetingUrl(response.url);
+      await Clipboard.setStringAsync(response.url);
+      await Share.share({ message: `${data.title}: ${response.url}`, url: response.url });
+    } catch (e: any) { Alert.alert("Fmail Meet", e?.message || "Could not share this meeting."); }
+    finally { setShareBusy(false); }
+  };
+
+  const copyMeeting = async () => {
+    setShareBusy(true);
+    try { const response = meetingUrl ? { url: meetingUrl } : await api.post(`/meetings/${id}/share`); setMeetingUrl(response.url); await Clipboard.setStringAsync(response.url); Alert.alert("Meeting link copied", response.url); }
+    catch (e: any) { Alert.alert("Fmail Meet", e?.message || "Could not copy this meeting link."); }
+    finally { setShareBusy(false); }
+  };
 
   const genNotes = useMutation({
     mutationFn: () => api.post(`/meetings/${id}/notes`),
@@ -93,6 +114,10 @@ export default function Meeting() {
     <View style={{ flex: 1, backgroundColor: colors.surface }}>
       <Header title={data.title} subtitle={`${data.mode} · ${(data.attendees || []).length + 1} people`} back showSearch={false} />
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: insets.bottom + 20 }}>
+        <View style={{ flexDirection: "row", gap: 10, marginBottom: 16 }}>
+          <Button title="Share link" icon="share-variant" small variant="secondary" loading={shareBusy} onPress={shareMeeting} testID="share-meeting" style={{ flex: 1 }} />
+          <Button title="Copy link" icon="content-copy" small variant="secondary" loading={shareBusy} onPress={copyMeeting} testID="copy-meeting" style={{ flex: 1 }} />
+        </View>
         <View style={{ flexDirection: "row", gap: 10, marginBottom: 16 }}>
           <Button title="Rejoin" icon="video" small style={{ flex: 1 }} onPress={() => setInCall(true)} testID="rejoin" />
           <Button title="Ask Meeting" icon="robot-happy-outline" variant="secondary" small style={{ flex: 1 }} onPress={() => setAskOpen(true)} testID="ask-meeting" />

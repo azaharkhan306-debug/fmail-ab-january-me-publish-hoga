@@ -4,6 +4,8 @@ import { LogBox } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { KeyboardProvider } from "react-native-keyboard-controller";
 import { StatusBar } from "expo-status-bar";
+import { useEffect } from "react";
+import { track } from "@/src/analytics";
 
 import { ErrorBoundary } from "@/src/components/error-boundary";
 import { queryClient } from "@/src/query-client";
@@ -14,6 +16,7 @@ LogBox.ignoreAllLogs(true);
 
 export default function RootLayout() {
   const { scheme, colors } = useTheme();
+  useEffect(() => { track("app_open"); }, []);
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>

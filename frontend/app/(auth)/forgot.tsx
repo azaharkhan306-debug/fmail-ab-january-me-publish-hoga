@@ -37,8 +37,7 @@ export default function Forgot() {
       setStep("reset");
       setCooldown(30);
       if (r.delivered) setInfo(`If an account exists, we sent a reset code to ${email.trim()}.`);
-      else if (r.devCode) { setCode(r.devCode); setInfo("Email delivery isn't configured yet — your code is pre-filled for testing."); }
-      else setInfo("If an account exists, a reset code was generated.");
+      else setInfo("If an account exists, a reset email was sent.");
     } catch (e: any) { setError(e.message); }
     finally { setLoading(false); }
   };
@@ -48,8 +47,7 @@ export default function Forgot() {
     try {
       const r = await api.post("/auth/request-otp", { email: email.trim(), purpose: "reset" });
       setCooldown(30);
-      if (r.devCode) setCode(r.devCode);
-      setInfo("A new code was generated.");
+      setInfo(r.delivered ? "A new code was sent." : "If an account exists, a new reset email was sent.");
     } catch (e: any) { setError(e.message); }
   };
 

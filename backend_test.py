@@ -10,7 +10,7 @@ import time
 import base64
 import sys
 
-BASE_URL = "https://f281a24f-dfd7-44e5-9aed-69e8b24e7d98.preview.emergentagent.com/api"
+BASE_URL = "https://fmail-staging.preview.emergentagent.com/api"
 DEMO_EMAIL = "demo@fmail.com"
 DEMO_PASSWORD = "demo123"
 

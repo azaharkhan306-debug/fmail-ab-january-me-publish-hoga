@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1022499911639",
+    "project_id": "fmail-a296f",
+    "storage_bucket": "fmail-a296f.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1022499911639:android:f7805af1a2380d76ab3d92",
+        "android_client_info": {
+          "package_name": "com.fmail.appcom.mail.com.famil"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAALKyCH-jYBFCbeubfNZ-DeUePMrwhtQ0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

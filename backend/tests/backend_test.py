@@ -1,7 +1,7 @@
 """End-to-end backend tests for Fmail API."""
 import os, requests, pytest
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://app-runner-preview.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "https://fmail-staging.preview.emergentagent.com").rstrip("/")
 
 
 # ------------------- health/auth -------------------

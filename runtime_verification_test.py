@@ -7,7 +7,7 @@ import requests
 import json
 
 # Backend URL from frontend/.env
-BASE_URL = "https://f281a24f-dfd7-44e5-9aed-69e8b24e7d98.preview.emergentagent.com/api"
+BASE_URL = "https://fmail-staging.preview.emergentagent.com/api"
 
 # Test credentials from test_credentials.md
 DEMO_EMAIL = "demo@fmail.com"

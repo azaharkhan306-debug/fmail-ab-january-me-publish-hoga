@@ -1,4 +1,7 @@
 import React, { createContext, useContext, useEffect, useState, useCallback } from "react";
+import { Platform } from "react-native";
+import * as WebBrowser from "expo-web-browser";
+import * as Linking from "expo-linking";
 import { api, setToken, clearToken, getToken } from "@/src/api";
 import { storage } from "@/src/utils/storage";
 import { track } from "@/src/analytics";
@@ -8,7 +11,8 @@ import "@/src/firebase"; // ensure Firebase app is initialized app-wide
 const USER_KEY = "fmail_user";
 
 type User = {
-  id: string; email: string; name: string; handle: string; fmail: string;
+  id: string; email: string; name: string;
+  gmailConnected?: boolean; gmailEmail?: string | null;
   photo?: string | null; signature?: string; aliases?: string[];
   connectedAccounts?: any[]; aiEnabled?: boolean; memoryEnabled?: boolean; darkMode?: string;
 };
@@ -17,7 +21,8 @@ type AuthCtx = {
   user: User | null;
   loading: boolean;
   login: (email: string, password: string) => Promise<void>;
-  signup: (email: string, password: string, name: string, username: string, code?: string) => Promise<void>;
+  loginWithGoogle: () => Promise<void>;
+  signup: (email: string, password: string, name: string, code?: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
   setUser: (u: User) => void;
@@ -69,8 +74,29 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await track("login");
   };
 
-  const signup = async (email: string, password: string, name: string, username: string, code?: string) => {
-    const res = await api.post("/auth/signup", { email, password, name, username, code });
+  // Single-tap: Google sign-in that also connects the user's Gmail mailbox.
+  const loginWithGoogle = async () => {
+    const { url } = await api.get("/auth/google/login-url");
+    const returnUrl = Linking.createURL("auth");
+    const result = await WebBrowser.openAuthSessionAsync(url, returnUrl);
+    if (result.type !== "success" || !result.url) {
+      if (result.type === "cancel" || result.type === "dismiss") return;
+      throw new Error("Google sign-in was cancelled.");
+    }
+    const parsed = Linking.parse(result.url);
+    const code = (parsed.queryParams?.code as string) || "";
+    const err = (parsed.queryParams?.error as string) || "";
+    if (err) throw new Error("Google sign-in could not be completed. Please try again.");
+    if (!code) throw new Error("Google sign-in did not return a code. Please try again.");
+    const res = await api.post("/auth/google/exchange", { code });
+    await setToken(res.token);
+    setUser(res.user);
+    try { await api.post("/gmail/sync"); } catch {}
+    await track("login_google");
+  };
+
+  const signup = async (email: string, password: string, name: string, code?: string) => {
+    const res = await api.post("/auth/signup", { email, password, name, code });
     await setToken(res.token);
     setUser(res.user);
     await track("signup");
@@ -89,7 +115,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <Ctx.Provider value={{ user, loading, login, signup, logout, refresh, setUser }}>
+    <Ctx.Provider value={{ user, loading, login, loginWithGoogle, signup, logout, refresh, setUser }}>
       {children}
     </Ctx.Provider>
   );

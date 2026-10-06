@@ -96,7 +96,7 @@ export default function Compose() {
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: colors.divider }}>
           <Icon name="at" size={18} color={colors.brandPrimary} />
           <T size={13} color={colors.muted}>From</T>
-          <T size={14} weight="600">{user?.fmail}</T>
+          <T size={14} weight="600">{user?.gmailEmail || user?.email}</T>
         </View>
 
         <View style={{ gap: 12, marginTop: 14 }}>

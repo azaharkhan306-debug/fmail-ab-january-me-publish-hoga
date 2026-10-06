@@ -85,7 +85,7 @@ export default function Settings() {
           <T size={20} weight="800" style={{ marginTop: 12 }}>{user?.name}</T>
           {photoError ? <T size={12} color={colors.error} style={{ marginTop: 6 }}>{photoError}</T> : null}
           <View style={{ backgroundColor: colors.brandTertiary, paddingHorizontal: 12, paddingVertical: 5, borderRadius: radius.pill, marginTop: 6 }}>
-            <Text style={{ color: colors.onBrandTertiary, fontWeight: "700" }}>{user?.fmail}</Text>
+            <Text style={{ color: colors.onBrandTertiary, fontWeight: "700" }}>{user?.gmailEmail || user?.email}</Text>
           </View>
           <View style={{ flexDirection: "row", gap: 10, marginTop: 14 }}>
             <Button title="Change photo" variant="secondary" small icon="image-edit-outline" testID="btn-change-photo" loading={busy} onPress={changePhoto} />
@@ -97,14 +97,14 @@ export default function Settings() {
         <SectionTitle text="CONNECTED ACCOUNTS" />
         <Card style={{ marginBottom: 16, paddingVertical: 4 }}>
           {(user?.connectedAccounts || []).map((a: any, i: number) => (
-            <View key={i} style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 12, borderBottomWidth: i === (user?.connectedAccounts?.length || 0) - 1 ? 0 : 1, borderBottomColor: colors.divider }}>
+            <Pressable key={i} onPress={() => router.push("/gmail")} testID={`account-${a.provider}`} style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingVertical: 12, borderBottomWidth: i === (user?.connectedAccounts?.length || 0) - 1 ? 0 : 1, borderBottomColor: colors.divider }}>
               <Icon name={ACC_ICON[a.provider] || "email"} size={22} color={colors.onSurface} />
               <View style={{ flex: 1 }}>
                 <T size={14} weight="700" style={{ textTransform: "capitalize" }}>{a.provider}</T>
-                <T size={12} color={colors.muted}>{a.email || "Not connected"}</T>
+                <T size={12} color={colors.muted}>{a.email || "Tap to connect your mailbox"}</T>
               </View>
               <Badge label={a.connected ? "Connected" : "Connect"} color={a.connected ? colors.success : colors.muted} tone="soft" />
-            </View>
+            </Pressable>
           ))}
         </Card>
 

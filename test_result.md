@@ -394,5 +394,94 @@ agent_communication:
 agent_communication:
     - agent: "main"
       message: "Backend 137/137 passed. Expo frontend regression is authorized by the user's explicit request; verify every screen and interaction before any OTP-provider configuration."
+
+
+# ============================================================================
+# GMAIL CLIENT CONVERSION — full implementation pass (one shot)
+# ============================================================================
+backend:
+  - task: "Remove @fmails.in identity system (handle/username/check-handle) + simplified signup"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "SignupIn no longer requires username; signup creates account with no handle/fmail and no seed data; OTP only enforced when Resend configured. Removed GET /auth/check-handle (now 404). current_user enriched with gmailConnected/gmailEmail and connectedAccounts=[gmail]. Verify: signup without username works and returns token+user with NO handle/fmail; /auth/check-handle returns 404; demo@fmail.com/demo123 login still works; /auth/me returns gmailConnected=false, gmailEmail=null."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED all identity removal tests: (1) GET /auth/check-handle?handle=demo returns 404 (endpoint successfully removed). (2) POST /auth/signup with ONLY {email, password, name} (NO username field) succeeds, returns {token, user}, and user object does NOT contain 'handle' or 'fmail' keys (CRITICAL requirement verified). (3) Demo login demo@fmail.com/demo123 works and returns token+user. (4) GET /auth/me returns user with gmailConnected=false, gmailEmail=null, connectedAccounts=[{provider:'gmail', email:'', connected:false}], and does NOT expose password field. All security checks passed - no secrets leaked."
+  - task: "Real Google OAuth sign-in + Gmail connect (login-url/exchange/authorize/callback/connect/disconnect)"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "GET /auth/google/config returns configured:true (creds set). GET /auth/google/login-url (public) returns a Google auth URL with gmail.modify scope + state. POST /auth/google/exchange rejects invalid/expired code with 400. GET /auth/google/authorize (authed) returns URL. Callback handles login(create/find user + one-time code redirect frontend://auth?code=) and connect. POST /auth/google/disconnect clears account+gmail emails. Full OAuth round trip needs a real Google consent (cannot complete headless) — verify endpoints return correct shapes and safe errors without live consent."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED all Google OAuth endpoint tests: (1) GET /auth/google/config returns {configured:true, provider:'google', project:'fmail-a296f'}. (2) GET /auth/google/login-url (public, no auth) returns {url} where url contains 'accounts.google.com', scope includes 'gmail.modify', and has 'state' param. (3) POST /auth/google/exchange with {code:'invalid'} returns 400 with safe message 'This sign-in link has expired. Please try again.' (no secrets exposed). (4) GET /auth/google/authorize (demo auth) returns {url} containing accounts.google.com. (5) POST /auth/google/disconnect (demo auth) returns {connected:false} (succeeds even if nothing connected). All endpoint shapes correct, safe error messages verified, no secrets leaked."
+  - task: "Real Gmail sync (labels->folders, full body/html, attachments, incremental history), send/reply/forward, drafts CRUD, trash/delete, label modify, attachment download, Gmail search"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "POST /gmail/sync requires connected account (400 when none). compose now sends via Gmail messages.send (MIME with To/Cc/Bcc/attachments + In-Reply-To/References threading) when account connected, else local fallback (demo). drafts via /drafts create/update, delete via /drafts or messages.trash/delete. PATCH maps star/important/read to Gmail label modify. GET /emails/{mid}/attachment/{attachmentId} returns base64. /search pulls live Gmail results when connected. Background poller every 45s + Pub/Sub webhook /gmail/push + /gmail/watch. For demo account (no Gmail) verify compose/draft/delete/patch local fallback still works and AI endpoints still operate on cached emails."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED all Gmail and email local fallback tests: (1) GET /gmail/status (demo auth) returns {connected:false, email:null, needsReconnect:false}. (2) POST /gmail/sync (demo auth) returns 400 'Connect a Google account before syncing Gmail.' (3) POST /gmail/watch (demo auth) returns 503 'Real-time Gmail push is not configured. Server-side polling is active instead.' (no Pub/Sub topic configured). (4) POST /gmail/push (public webhook) with empty body returns 200 {ok:true} (does not crash). (5) EMAIL LOCAL FALLBACK for demo account: POST /emails/compose with {to, subject, body, cc, bcc, attachments:[]} (draft:false) returns doc with folder='sent', cc='cc@example.com', bcc='bcc@example.com'. (6) POST /emails/compose with draft:true returns folder='drafts' and appears in GET /emails?folder=drafts. (7) GET /emails?folder=inbox returns array with 5 emails. (8) GET /threads/{threadId} works for existing inbox thread. (9) PATCH /emails/{threadId} with {star:true} and {important:true} returns ok:true. (10) DELETE /emails/{threadId} first time moves to trash (ok:true), second time permanently deletes (ok:true, not in trash list). All local fallback functionality working correctly for demo account without Gmail."
+  - task: "Gmail new-mail FCM notifications with threadId payload"
+    implemented: true
+    working: true
+    file: "server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "_notify_new_email now includes data.threadId/messageId and android/apns config. Fired from _sync_gmail_account on genuinely new inbox messages (never on first sync). FCM delivery only verifiable on a real device build. Verify push/register still validates+stores tokens."
+        - working: true
+          agent: "testing"
+          comment: "✅ PASSED push notification endpoint tests: (1) POST /push/register with short token (<20 chars) returns 422 (validation working). (2) POST /push/register with valid long token (50 chars) returns {registered:true}. Token validation and registration working correctly. Note: FCM delivery with threadId payload can only be fully verified on a real device build with Firebase configured, which is expected and documented."
+
+frontend:
+  - task: "Welcome/Login/Signup Gmail-first flow, settings/compose/mail display, notification tap routing, attachments, reply-all"
+    implemented: true
+    working: "NA"
+    file: "multiple"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Welcome leads with Continue with Google (loginWithGoogle via WebBrowser+exchange). Removed Create your Fmail identity + @fmails.in UI. Login has real Google button + email/password. Signup simplified to name/email/password (+OTP fallback). auth.tsx loginWithGoogle added; User type dropped handle/fmail, added gmailConnected/gmailEmail. settings/compose/home show gmailEmail||email. mail.tsx removed provider chips, added Connect Gmail banner + sync on pull-to-refresh. gmail.tsx has status/connect/sync/disconnect/reconnect. notifications.ts routes taps to /thread/{threadId}. thread shows attachments (download) + Reply all. NOTE: Google OAuth round-trip + FCM only fully testable on native build; web preview can verify UI, email/password login, navigation, and that Google button launches the auth session."
+
+metadata:
+  test_sequence: 11
+  run_ui: false
+test_plan:
+  current_focus: []
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+agent_communication:
+    - agent: "main"
+      message: "Converted Fmail into a real Gmail client. Please run BACKEND tests only. Demo account demo@fmail.com/demo123 has NO Gmail connected, so compose/draft/delete/patch should use the local fallback and all AI endpoints should still work on cached emails. Verify: (1) /auth/check-handle is 404. (2) signup with only email/password/name returns token + user WITHOUT handle/fmail. (3) /auth/me includes gmailConnected=false, gmailEmail=null, connectedAccounts=[{provider:gmail,...}]. (4) /auth/google/config configured=true; /auth/google/login-url returns a Google URL with gmail.modify scope; /auth/google/exchange with bad code -> 400; /auth/google/authorize (authed) returns URL; /gmail/status connected=false; /gmail/sync -> 400 (no account); /gmail/watch -> 503 (no Pub/Sub topic). (5) compose/draft/delete(trash then permanent)/patch star/important work for demo (local fallback). (6) All AI endpoints (compose/reply/understand/thread/ask/email-to-task) still work. (7) push/register validates token length. (8) No secrets exposed; OAuth client secret / Firebase private key never returned. Do NOT attempt a live Google consent flow (not possible headless)."
     - agent: "main"
       message: "Run request complete: created backend/.env (user-supplied keys incl. Sarvam, Firebase, Google Client ID, Emergent keys), backend/firebase-service-account.json, frontend/google-services.json, frontend/.env (EXPO_PUBLIC_BACKEND_URL). Backend + Expo running via supervisor. Fresh MongoDB seeded with demo@fmail.com / demo123 (+ demo data). Verified: GET /api/ ok, login returns token, welcome/login/dashboard render in preview. NOTES: Gmail OAuth still gated (GOOGLE_CLIENT_SECRET + GOOGLE_REDIRECT_URI not supplied); OTP delivery fail-closed (backend expects RESEND_API_KEY, user supplied EMERGENT_EMAIL_KEY which server.py does not read yet); google-services.json package_name 'com.fmail.appcom.mail.com.famil' mismatches app.json android package 'in.fmail.app'."
+    - agent: "testing"
+      message: "✅ COMPREHENSIVE GMAIL CLIENT BACKEND TESTING COMPLETE - ALL 29 TESTS PASSED: (1) Root endpoint GET /api/ returns 200 {status:ok}. (2) AUTH IDENTITY REMOVAL: GET /auth/check-handle?handle=demo returns 404 (endpoint removed), POST /auth/signup with ONLY {email, password, name} succeeds and user object does NOT contain 'handle' or 'fmail' keys (CRITICAL requirement verified), demo@fmail.com/demo123 login works, GET /auth/me returns gmailConnected=false/gmailEmail=null/connectedAccounts with gmail provider and does NOT expose password. (3) GOOGLE OAUTH ENDPOINTS: /auth/google/config returns {configured:true, provider:'google', project:'fmail-a296f'}, /auth/google/login-url returns URL with accounts.google.com + gmail.modify scope + state param, /auth/google/exchange with invalid code returns 400 with safe message, /auth/google/authorize returns OAuth URL, /auth/google/disconnect returns {connected:false}. (4) GMAIL ENDPOINTS (demo has no Gmail): /gmail/status returns {connected:false, email:null, needsReconnect:false}, /gmail/sync returns 400 'Connect a Google account before syncing Gmail', /gmail/watch returns 503 (no Pub/Sub topic), /gmail/push webhook returns 200 {ok:true} for empty body. (5) EMAIL LOCAL FALLBACK (demo account): compose with cc/bcc/attachments returns folder='sent', draft compose returns folder='drafts' and appears in drafts list, inbox list returns array, thread read works, PATCH updates star/important, DELETE first time moves to trash and second time permanently deletes. (6) AI ENDPOINTS work on cached emails: /ai/compose returns {subject, body}, /ai/reply returns {text}, /ai/understand returns intent/topic, /ai/thread returns summary, /ai/ask returns {answer}, /ai/email-to-task returns task with title. (7) PUSH: /push/register with short token returns 422, with valid token returns {registered:true}. (8) SECURITY: NO response leaks Google client secret (GOCSPX), Firebase private key, JWT secret, or OTP codes - all security checks passed. (9) Backend logs clean - no crashes, errors, or tracebacks during test run. All Gmail client conversion requirements verified successfully."

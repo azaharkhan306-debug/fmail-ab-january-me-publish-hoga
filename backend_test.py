@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Comprehensive backend regression test for Fmail API.
-Tests all route groups with success and failure cases.
-Uses demo@fmail.com / demo123 for authenticated endpoints.
+Comprehensive backend test for Fmail Gmail client conversion.
+Tests all endpoints with focus on identity removal, Google OAuth, Gmail integration, and local fallback.
 """
-import httpx
+import requests
 import json
-import time
-import base64
-import sys
+import secrets
+from typing import Dict, Any, Optional
 
-BASE_URL = "https://fmail-staging.preview.emergentagent.com/api"
+# Backend URL from frontend/.env
+BASE_URL = "https://156b1505-8090-42e9-aeff-8a71243aec71.preview.emergentagent.com/api"
+
+# Demo account credentials (has NO Gmail connected)
 DEMO_EMAIL = "demo@fmail.com"
 DEMO_PASSWORD = "demo123"
 
@@ -19,1135 +20,897 @@ passed = 0
 failed = 0
 failures = []
 
-def test(name, condition, details=""):
+def log_test(name: str, success: bool, details: str = ""):
     global passed, failed, failures
-    if condition:
+    if success:
         passed += 1
-        print(f"✓ {name}")
+        print(f"✅ PASS: {name}")
+        if details:
+            print(f"   {details}")
     else:
         failed += 1
         failures.append(f"{name}: {details}")
-        print(f"✗ {name}: {details}")
+        print(f"❌ FAIL: {name}")
+        print(f"   {details}")
 
-def get_demo_token():
-    """Login with demo account and return token."""
+def check_no_secrets(data: Any, test_name: str) -> bool:
+    """Verify no secrets are leaked in response."""
+    text = json.dumps(data) if isinstance(data, (dict, list)) else str(data)
+    secrets_found = []
+    
+    # Check for Google client secret
+    if "GOCSPX" in text:
+        secrets_found.append("Google client secret (GOCSPX)")
+    
+    # Check for Firebase private key
+    if "BEGIN PRIVATE KEY" in text or "private_key" in text.lower():
+        secrets_found.append("Firebase private key")
+    
+    # Check for JWT secret
+    if "fmail-local-development-session-secret" in text:
+        secrets_found.append("JWT secret")
+    
+    # Check for OTP codes (6 digits)
+    if "devCode" in text or "testCode" in text:
+        secrets_found.append("OTP test code")
+    
+    if secrets_found:
+        log_test(f"Security check: {test_name}", False, f"LEAKED SECRETS: {', '.join(secrets_found)}")
+        return False
+    return True
+
+def test_root():
+    """Test 1: GET /api/ returns 200 {status: ok}"""
     try:
-        r = httpx.post(f"{BASE_URL}/auth/login", json={"email": DEMO_EMAIL, "password": DEMO_PASSWORD}, timeout=30)
-        if r.status_code == 200:
-            return r.json()["token"]
+        resp = requests.get(f"{BASE_URL}/", timeout=10)
+        data = resp.json()
+        
+        success = resp.status_code == 200 and data.get("status") == "ok"
+        log_test("GET /api/ returns 200 with status=ok", success, 
+                f"Status: {resp.status_code}, Response: {data}")
+        check_no_secrets(data, "root endpoint")
+        return success
+    except Exception as e:
+        log_test("GET /api/ returns 200 with status=ok", False, str(e))
+        return False
+
+def test_check_handle_removed():
+    """Test 2.1: GET /api/auth/check-handle?handle=demo returns 404 (endpoint removed)"""
+    try:
+        resp = requests.get(f"{BASE_URL}/auth/check-handle", params={"handle": "demo"}, timeout=10)
+        
+        success = resp.status_code == 404
+        log_test("GET /auth/check-handle returns 404 (endpoint removed)", success,
+                f"Status: {resp.status_code}")
+        if resp.status_code != 404:
+            check_no_secrets(resp.text, "check-handle endpoint")
+        return success
+    except Exception as e:
+        log_test("GET /auth/check-handle returns 404 (endpoint removed)", False, str(e))
+        return False
+
+def test_signup_no_username():
+    """Test 2.2: POST /api/auth/signup with ONLY {email, password, name} (NO username)"""
+    try:
+        # Generate unique email for throwaway account
+        unique_email = f"test_{secrets.token_hex(8)}@throwaway.com"
+        
+        payload = {
+            "email": unique_email,
+            "password": "test123456",
+            "name": "Test User"
+        }
+        
+        resp = requests.post(f"{BASE_URL}/auth/signup", json=payload, timeout=10)
+        data = resp.json()
+        
+        # Check response structure
+        has_token = "token" in data
+        has_user = "user" in data
+        user = data.get("user", {})
+        
+        # Critical: user must NOT contain 'handle' or 'fmail' keys
+        has_handle = "handle" in user
+        has_fmail = "fmail" in user
+        has_password = "password" in user
+        
+        success = (resp.status_code == 200 and has_token and has_user and 
+                  not has_handle and not has_fmail and not has_password)
+        
+        details = f"Status: {resp.status_code}, has_token: {has_token}, has_user: {has_user}, "
+        details += f"user_has_handle: {has_handle}, user_has_fmail: {has_fmail}, user_has_password: {has_password}"
+        
+        if has_handle or has_fmail:
+            details += f"\n   ❌ CRITICAL: User object contains forbidden keys! User: {user}"
+        
+        log_test("Signup without username field succeeds, user has NO handle/fmail", success, details)
+        check_no_secrets(data, "signup endpoint")
+        
+        # Clean up: delete the throwaway account
+        if has_token:
+            try:
+                token = data["token"]
+                del_resp = requests.delete(f"{BASE_URL}/auth/account", 
+                                          headers={"Authorization": f"Bearer {token}"}, 
+                                          timeout=10)
+                if del_resp.status_code == 200:
+                    print(f"   🗑️  Cleaned up throwaway account: {unique_email}")
+            except Exception as cleanup_err:
+                print(f"   ⚠️  Failed to cleanup throwaway account: {cleanup_err}")
+        
+        return success
+    except Exception as e:
+        log_test("Signup without username field succeeds, user has NO handle/fmail", False, str(e))
+        return False
+
+def test_demo_login():
+    """Test 2.3: Login demo@fmail.com/demo123 works"""
+    try:
+        payload = {"email": DEMO_EMAIL, "password": DEMO_PASSWORD}
+        resp = requests.post(f"{BASE_URL}/auth/login", json=payload, timeout=10)
+        data = resp.json()
+        
+        has_token = "token" in data
+        has_user = "user" in data
+        
+        success = resp.status_code == 200 and has_token and has_user
+        log_test("Demo login (demo@fmail.com/demo123) works", success,
+                f"Status: {resp.status_code}, has_token: {has_token}, has_user: {has_user}")
+        check_no_secrets(data, "login endpoint")
+        
+        return data.get("token") if success else None
+    except Exception as e:
+        log_test("Demo login (demo@fmail.com/demo123) works", False, str(e))
         return None
-    except Exception as e:
-        print(f"Failed to get demo token: {e}")
-        return None
 
-def auth_headers(token):
-    return {"Authorization": f"Bearer {token}"}
-
-print("=" * 80)
-print("FMAIL BACKEND COMPREHENSIVE REGRESSION TEST")
-print("=" * 80)
-print()
-
-# ============================================================================
-# 1. ROOT / HEALTH CHECK
-# ============================================================================
-print("1. ROOT / HEALTH CHECK")
-print("-" * 80)
-try:
-    r = httpx.get(f"{BASE_URL}/", timeout=30)
-    test("GET / returns 200", r.status_code == 200, f"Got {r.status_code}")
-    test("GET / returns status ok", r.json().get("status") == "ok", f"Got {r.json()}")
-except Exception as e:
-    test("GET / returns 200", False, str(e))
-    test("GET / returns status ok", False, str(e))
-print()
-
-# ============================================================================
-# 2. SIGNUP VALIDATION AND OTP FAIL-CLOSED
-# ============================================================================
-print("2. SIGNUP VALIDATION AND OTP FAIL-CLOSED")
-print("-" * 80)
-
-# Test OTP request without Resend configured
-try:
-    r = httpx.post(f"{BASE_URL}/auth/request-otp", json={"email": "newuser@test.com", "purpose": "signup"}, timeout=30)
-    test("POST /auth/request-otp returns 503 (no Resend)", r.status_code == 503, f"Got {r.status_code}")
-    response_text = r.text.lower()
-    test("OTP response has safe error message", "unavailable" in response_text or "temporarily" in response_text, f"Got: {r.text[:200]}")
-    # CRITICAL: Check no devCode or test OTP exposed
-    test("NO devCode exposed in OTP response", "devcode" not in response_text and "dev_code" not in response_text, f"Response: {r.text[:200]}")
-    test("NO test OTP exposed in OTP response", "123456" not in response_text and "000000" not in response_text, f"Response: {r.text[:200]}")
-except Exception as e:
-    test("POST /auth/request-otp returns 503 (no Resend)", False, str(e))
-    test("OTP response has safe error message", False, str(e))
-    test("NO devCode exposed in OTP response", False, str(e))
-    test("NO test OTP exposed in OTP response", False, str(e))
-
-# Test signup requires OTP code
-try:
-    r = httpx.post(f"{BASE_URL}/auth/signup", json={
-        "email": "newuser@test.com",
-        "password": "password123",
-        "name": "New User",
-        "username": "newuser",
-        "code": "000000"
-    }, timeout=30)
-    test("POST /auth/signup with invalid code returns 400", r.status_code == 400, f"Got {r.status_code}")
-    test("Signup error mentions verification", "verif" in r.text.lower() or "code" in r.text.lower(), f"Got: {r.text[:200]}")
-except Exception as e:
-    test("POST /auth/signup with invalid code returns 400", False, str(e))
-    test("Signup error mentions verification", False, str(e))
-
-print()
-
-# ============================================================================
-# 3. VERIFY/RESET INVALID/EXPIRED/WRONG CODE AND COOLDOWN/RATE-LIMIT
-# ============================================================================
-print("3. VERIFY/RESET INVALID/EXPIRED/WRONG CODE AND COOLDOWN/RATE-LIMIT")
-print("-" * 80)
-
-# Test verify-otp with no OTP requested
-try:
-    r = httpx.post(f"{BASE_URL}/auth/verify-otp", json={"email": "test@test.com", "code": "123456", "purpose": "signup"}, timeout=30)
-    test("POST /auth/verify-otp without request returns 400", r.status_code == 400, f"Got {r.status_code}")
-    test("Verify error mentions request code first", "request" in r.text.lower(), f"Got: {r.text[:200]}")
-except Exception as e:
-    test("POST /auth/verify-otp without request returns 400", False, str(e))
-    test("Verify error mentions request code first", False, str(e))
-
-# Test reset-password with invalid code
-try:
-    r = httpx.post(f"{BASE_URL}/auth/reset-password", json={"email": DEMO_EMAIL, "code": "999999", "password": "newpass123"}, timeout=30)
-    test("POST /auth/reset-password with invalid code returns 400", r.status_code == 400, f"Got {r.status_code}")
-except Exception as e:
-    test("POST /auth/reset-password with invalid code returns 400", False, str(e))
-
-# Test OTP cooldown - request twice quickly
-try:
-    r1 = httpx.post(f"{BASE_URL}/auth/request-otp", json={"email": "cooldown@test.com", "purpose": "signup"}, timeout=30)
-    time.sleep(1)  # Wait 1 second (cooldown is 30s)
-    r2 = httpx.post(f"{BASE_URL}/auth/request-otp", json={"email": "cooldown@test.com", "purpose": "signup"}, timeout=30)
-    # Both should return 503 (no Resend) or second should return 429 (cooldown)
-    test("OTP cooldown enforced or service unavailable", r2.status_code in [429, 503], f"Got {r2.status_code}")
-except Exception as e:
-    test("OTP cooldown enforced or service unavailable", False, str(e))
-
-print()
-
-# ============================================================================
-# 4. LOGIN/ME/LOGOUT-EQUIVALENT SESSION BEHAVIOR
-# ============================================================================
-print("4. LOGIN/ME/LOGOUT-EQUIVALENT SESSION BEHAVIOR")
-print("-" * 80)
-
-# Test login with demo account
-token = None
-try:
-    r = httpx.post(f"{BASE_URL}/auth/login", json={"email": DEMO_EMAIL, "password": DEMO_PASSWORD}, timeout=30)
-    test("POST /auth/login with demo account returns 200", r.status_code == 200, f"Got {r.status_code}")
-    if r.status_code == 200:
-        data = r.json()
-        test("Login returns token", "token" in data, f"Keys: {list(data.keys())}")
-        test("Login returns user", "user" in data, f"Keys: {list(data.keys())}")
-        token = data.get("token")
-    else:
-        test("Login returns token", False, f"Status {r.status_code}")
-        test("Login returns user", False, f"Status {r.status_code}")
-except Exception as e:
-    test("POST /auth/login with demo account returns 200", False, str(e))
-    test("Login returns token", False, str(e))
-    test("Login returns user", False, str(e))
-
-# Test login with wrong password
-try:
-    r = httpx.post(f"{BASE_URL}/auth/login", json={"email": DEMO_EMAIL, "password": "wrongpassword"}, timeout=30)
-    test("POST /auth/login with wrong password returns 401", r.status_code == 401, f"Got {r.status_code}")
-except Exception as e:
-    test("POST /auth/login with wrong password returns 401", False, str(e))
-
-# Test /auth/me with valid token
-if token:
+def test_auth_me(token: str):
+    """Test 2.4: GET /api/auth/me returns correct structure"""
     try:
-        r = httpx.get(f"{BASE_URL}/auth/me", headers=auth_headers(token), timeout=30)
-        test("GET /auth/me with valid token returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            user = r.json()
-            test("GET /auth/me returns user email", user.get("email") == DEMO_EMAIL, f"Got: {user.get('email')}")
-            test("GET /auth/me does not expose password", "password" not in user, f"Keys: {list(user.keys())}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/auth/me", headers=headers, timeout=10)
+        data = resp.json()
+        
+        # Check required fields
+        has_gmail_connected = "gmailConnected" in data
+        has_gmail_email = "gmailEmail" in data
+        has_connected_accounts = "connectedAccounts" in data
+        has_password = "password" in data
+        
+        gmail_connected = data.get("gmailConnected")
+        gmail_email = data.get("gmailEmail")
+        connected_accounts = data.get("connectedAccounts", [])
+        
+        # For demo account: gmailConnected should be false, gmailEmail should be null
+        correct_gmail_status = gmail_connected == False and gmail_email == None
+        
+        # connectedAccounts should have gmail provider
+        has_gmail_provider = False
+        if connected_accounts and len(connected_accounts) > 0:
+            has_gmail_provider = any(acc.get("provider") == "gmail" for acc in connected_accounts)
+        
+        success = (resp.status_code == 200 and has_gmail_connected and has_gmail_email and 
+                  has_connected_accounts and not has_password and correct_gmail_status and 
+                  has_gmail_provider)
+        
+        details = f"Status: {resp.status_code}, gmailConnected: {gmail_connected}, "
+        details += f"gmailEmail: {gmail_email}, has_password: {has_password}, "
+        details += f"connectedAccounts: {connected_accounts}"
+        
+        log_test("GET /auth/me returns correct structure (no password, gmailConnected=false)", 
+                success, details)
+        check_no_secrets(data, "auth/me endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /auth/me with valid token returns 200", False, str(e))
-        test("GET /auth/me returns user email", False, str(e))
-        test("GET /auth/me does not expose password", False, str(e))
-else:
-    test("GET /auth/me with valid token returns 200", False, "No token available")
-    test("GET /auth/me returns user email", False, "No token available")
-    test("GET /auth/me does not expose password", False, "No token available")
+        log_test("GET /auth/me returns correct structure", False, str(e))
+        return False
 
-# Test /auth/me with invalid token
-try:
-    r = httpx.get(f"{BASE_URL}/auth/me", headers={"Authorization": "Bearer invalid_token_12345"}, timeout=30)
-    test("GET /auth/me with invalid token returns 401", r.status_code == 401, f"Got {r.status_code}")
-except Exception as e:
-    test("GET /auth/me with invalid token returns 401", False, str(e))
-
-# Test /auth/me without token
-try:
-    r = httpx.get(f"{BASE_URL}/auth/me", timeout=30)
-    test("GET /auth/me without token returns 401 or 403", r.status_code in [401, 403], f"Got {r.status_code}")
-except Exception as e:
-    test("GET /auth/me without token returns 401 or 403", False, str(e))
-
-print()
-
-# Get fresh token for remaining tests
-if not token:
-    token = get_demo_token()
-    if not token:
-        print("CRITICAL: Cannot get demo token. Remaining tests will fail.")
-        print()
-
-# ============================================================================
-# 5. HANDLE AVAILABILITY
-# ============================================================================
-print("5. HANDLE AVAILABILITY")
-print("-" * 80)
-
-try:
-    r = httpx.get(f"{BASE_URL}/auth/check-handle?handle=demo", timeout=30)
-    test("GET /auth/check-handle for 'demo' returns 200", r.status_code == 200, f"Got {r.status_code}")
-    test("Handle 'demo' is taken", r.json().get("available") == False, f"Got: {r.json()}")
-except Exception as e:
-    test("GET /auth/check-handle for 'demo' returns 200", False, str(e))
-    test("Handle 'demo' is taken", False, str(e))
-
-try:
-    r = httpx.get(f"{BASE_URL}/auth/check-handle?handle=Demo", timeout=30)
-    test("Handle check is case-insensitive", r.json().get("available") == False, f"Got: {r.json()}")
-except Exception as e:
-    test("Handle check is case-insensitive", False, str(e))
-
-try:
-    unique_handle = f"testuser{int(time.time())}"
-    r = httpx.get(f"{BASE_URL}/auth/check-handle?handle={unique_handle}", timeout=30)
-    test("Unique handle is available", r.json().get("available") == True, f"Got: {r.json()}")
-except Exception as e:
-    test("Unique handle is available", False, str(e))
-
-try:
-    r = httpx.get(f"{BASE_URL}/auth/check-handle?handle=ab", timeout=30)
-    test("Handle 'ab' fails min length validation", r.json().get("available") == False, f"Got: {r.json()}")
-    test("Min length error mentions 3 characters", "3" in r.json().get("reason", ""), f"Got: {r.json()}")
-except Exception as e:
-    test("Handle 'ab' fails min length validation", False, str(e))
-    test("Min length error mentions 3 characters", False, str(e))
-
-try:
-    r = httpx.get(f"{BASE_URL}/auth/check-handle?handle=bad handle!", timeout=30)
-    test("Handle with invalid chars fails validation", r.json().get("available") == False, f"Got: {r.json()}")
-except Exception as e:
-    test("Handle with invalid chars fails validation", False, str(e))
-
-print()
-
-# ============================================================================
-# 6. PROFILE UPDATE
-# ============================================================================
-print("6. PROFILE UPDATE")
-print("-" * 80)
-
-if token:
+def test_google_config():
+    """Test 3.1: GET /api/auth/google/config"""
     try:
-        r = httpx.put(f"{BASE_URL}/auth/profile", headers=auth_headers(token), json={"name": "Demo User Updated"}, timeout=30)
-        test("PUT /auth/profile returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Profile update reflects new name", r.json().get("name") == "Demo User Updated", f"Got: {r.json().get('name')}")
+        resp = requests.get(f"{BASE_URL}/auth/google/config", timeout=10)
+        data = resp.json()
+        
+        configured = data.get("configured")
+        provider = data.get("provider")
+        project = data.get("project")
+        
+        success = (resp.status_code == 200 and configured == True and 
+                  provider == "google" and project == "fmail-a296f")
+        
+        log_test("GET /auth/google/config returns correct structure", success,
+                f"Status: {resp.status_code}, configured: {configured}, provider: {provider}, project: {project}")
+        check_no_secrets(data, "google/config endpoint")
+        
+        return success
     except Exception as e:
-        test("PUT /auth/profile returns 200", False, str(e))
-        test("Profile update reflects new name", False, str(e))
-else:
-    test("PUT /auth/profile returns 200", False, "No token")
-    test("Profile update reflects new name", False, "No token")
+        log_test("GET /auth/google/config returns correct structure", False, str(e))
+        return False
 
-print()
-
-# ============================================================================
-# 7. PERMISSIONS
-# ============================================================================
-print("7. PERMISSIONS")
-print("-" * 80)
-
-if token:
+def test_google_login_url():
+    """Test 3.2: GET /api/auth/google/login-url (public)"""
     try:
-        perms = {"notifications": True, "camera": True, "microphone": False}
-        r = httpx.put(f"{BASE_URL}/auth/permissions", headers=auth_headers(token), json={"permissions": perms}, timeout=30)
-        test("PUT /auth/permissions returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Permissions update reflects changes", r.json().get("permissions", {}).get("camera") == True, f"Got: {r.json().get('permissions')}")
+        resp = requests.get(f"{BASE_URL}/auth/google/login-url", timeout=10)
+        data = resp.json()
+        
+        url = data.get("url", "")
+        
+        has_accounts_google = "accounts.google.com" in url
+        has_gmail_modify = "gmail.modify" in url
+        has_state = "state=" in url
+        
+        success = (resp.status_code == 200 and has_accounts_google and 
+                  has_gmail_modify and has_state)
+        
+        log_test("GET /auth/google/login-url returns valid OAuth URL", success,
+                f"Status: {resp.status_code}, has_accounts_google: {has_accounts_google}, "
+                f"has_gmail_modify: {has_gmail_modify}, has_state: {has_state}")
+        check_no_secrets(data, "google/login-url endpoint")
+        
+        return success
     except Exception as e:
-        test("PUT /auth/permissions returns 200", False, str(e))
-        test("Permissions update reflects changes", False, str(e))
-else:
-    test("PUT /auth/permissions returns 200", False, "No token")
-    test("Permissions update reflects changes", False, "No token")
+        log_test("GET /auth/google/login-url returns valid OAuth URL", False, str(e))
+        return False
 
-print()
-
-# ============================================================================
-# 8. DELETE ACCOUNT SAFETY (skip actual deletion for demo account)
-# ============================================================================
-print("8. DELETE ACCOUNT SAFETY")
-print("-" * 80)
-
-# We won't actually delete the demo account, but test that endpoint requires auth
-try:
-    r = httpx.delete(f"{BASE_URL}/auth/account", timeout=30)
-    test("DELETE /auth/account without token returns 401/403", r.status_code in [401, 403], f"Got {r.status_code}")
-except Exception as e:
-    test("DELETE /auth/account without token returns 401/403", False, str(e))
-
-print()
-
-# ============================================================================
-# 9. INBOX FOLDERS/FILTERS/SEARCH
-# ============================================================================
-print("9. INBOX FOLDERS/FILTERS/SEARCH")
-print("-" * 80)
-
-if token:
+def test_google_exchange_invalid():
+    """Test 3.3: POST /api/auth/google/exchange with invalid code"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=inbox", headers=auth_headers(token), timeout=30)
-        test("GET /emails?folder=inbox returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Inbox returns array", isinstance(r.json(), list), f"Got type: {type(r.json())}")
+        payload = {"code": "invalid"}
+        resp = requests.post(f"{BASE_URL}/auth/google/exchange", json=payload, timeout=10)
+        
+        # Should return 400 with safe error message
+        success = resp.status_code == 400
+        
+        try:
+            data = resp.json()
+            message = data.get("detail", "")
+        except:
+            message = resp.text
+        
+        log_test("POST /auth/google/exchange with invalid code returns 400", success,
+                f"Status: {resp.status_code}, Message: {message}")
+        check_no_secrets(resp.text, "google/exchange endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?folder=inbox returns 200", False, str(e))
-        test("Inbox returns array", False, str(e))
+        log_test("POST /auth/google/exchange with invalid code returns 400", False, str(e))
+        return False
 
+def test_google_authorize(token: str):
+    """Test 3.4: GET /api/auth/google/authorize (authenticated)"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=sent", headers=auth_headers(token), timeout=30)
-        test("GET /emails?folder=sent returns 200", r.status_code == 200, f"Got {r.status_code}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/auth/google/authorize", headers=headers, timeout=10)
+        data = resp.json()
+        
+        url = data.get("url", "")
+        has_accounts_google = "accounts.google.com" in url
+        
+        success = resp.status_code == 200 and has_accounts_google
+        
+        log_test("GET /auth/google/authorize returns OAuth URL", success,
+                f"Status: {resp.status_code}, has_accounts_google: {has_accounts_google}")
+        check_no_secrets(data, "google/authorize endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?folder=sent returns 200", False, str(e))
+        log_test("GET /auth/google/authorize returns OAuth URL", False, str(e))
+        return False
 
+def test_google_disconnect(token: str):
+    """Test 3.5: POST /api/auth/google/disconnect"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=drafts", headers=auth_headers(token), timeout=30)
-        test("GET /emails?folder=drafts returns 200", r.status_code == 200, f"Got {r.status_code}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/auth/google/disconnect", headers=headers, timeout=10)
+        data = resp.json()
+        
+        connected = data.get("connected")
+        
+        success = resp.status_code == 200 and connected == False
+        
+        log_test("POST /auth/google/disconnect returns {connected:false}", success,
+                f"Status: {resp.status_code}, connected: {connected}")
+        check_no_secrets(data, "google/disconnect endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?folder=drafts returns 200", False, str(e))
+        log_test("POST /auth/google/disconnect returns {connected:false}", False, str(e))
+        return False
 
+def test_gmail_status(token: str):
+    """Test 4.1: GET /api/gmail/status (demo has no Gmail)"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=trash", headers=auth_headers(token), timeout=30)
-        test("GET /emails?folder=trash returns 200", r.status_code == 200, f"Got {r.status_code}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/gmail/status", headers=headers, timeout=10)
+        data = resp.json()
+        
+        connected = data.get("connected")
+        email = data.get("email")
+        needs_reconnect = data.get("needsReconnect")
+        
+        success = (resp.status_code == 200 and connected == False and 
+                  email == None and needs_reconnect == False)
+        
+        log_test("GET /gmail/status returns correct status for demo account", success,
+                f"Status: {resp.status_code}, connected: {connected}, email: {email}, needsReconnect: {needs_reconnect}")
+        check_no_secrets(data, "gmail/status endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?folder=trash returns 200", False, str(e))
+        log_test("GET /gmail/status returns correct status for demo account", False, str(e))
+        return False
 
+def test_gmail_sync(token: str):
+    """Test 4.2: POST /api/gmail/sync (should fail - no Gmail connected)"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=important", headers=auth_headers(token), timeout=30)
-        test("GET /emails?folder=important returns 200", r.status_code == 200, f"Got {r.status_code}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/gmail/sync", headers=headers, timeout=10)
+        
+        success = resp.status_code == 400
+        
+        try:
+            data = resp.json()
+            message = data.get("detail", "")
+            has_correct_message = "Connect a Google account" in message
+        except:
+            message = resp.text
+            has_correct_message = "Connect a Google account" in message
+        
+        log_test("POST /gmail/sync returns 400 with correct message", success and has_correct_message,
+                f"Status: {resp.status_code}, Message: {message}")
+        check_no_secrets(resp.text, "gmail/sync endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?folder=important returns 200", False, str(e))
+        log_test("POST /gmail/sync returns 400 with correct message", False, str(e))
+        return False
 
+def test_gmail_watch(token: str):
+    """Test 4.3: POST /api/gmail/watch (should return 503 - no Pub/Sub topic)"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?filter=unread", headers=auth_headers(token), timeout=30)
-        test("GET /emails?filter=unread returns 200", r.status_code == 200, f"Got {r.status_code}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/gmail/watch", headers=headers, timeout=10)
+        
+        success = resp.status_code == 503
+        
+        try:
+            data = resp.json()
+            message = data.get("detail", "")
+        except:
+            message = resp.text
+        
+        log_test("POST /gmail/watch returns 503 (no Pub/Sub topic)", success,
+                f"Status: {resp.status_code}, Message: {message}")
+        check_no_secrets(resp.text, "gmail/watch endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /emails?filter=unread returns 200", False, str(e))
-else:
-    for _ in range(6):
-        test("Email folder/filter endpoint", False, "No token")
+        log_test("POST /gmail/watch returns 503 (no Pub/Sub topic)", False, str(e))
+        return False
 
-print()
-
-# ============================================================================
-# 10. THREAD READ
-# ============================================================================
-print("10. THREAD READ")
-print("-" * 80)
-
-thread_id = None
-if token:
+def test_gmail_push_webhook():
+    """Test 4.4: POST /api/gmail/push (public webhook) with empty/invalid body"""
     try:
-        r = httpx.get(f"{BASE_URL}/emails?folder=inbox", headers=auth_headers(token), timeout=30)
-        if r.status_code == 200 and len(r.json()) > 0:
-            thread_id = r.json()[0].get("threadId")
-            if thread_id:
-                r2 = httpx.get(f"{BASE_URL}/threads/{thread_id}", headers=auth_headers(token), timeout=30)
-                test("GET /threads/{tid} returns 200", r2.status_code == 200, f"Got {r2.status_code}")
-                test("Thread response has messages", "messages" in r2.json(), f"Keys: {list(r2.json().keys())}")
-            else:
-                test("GET /threads/{tid} returns 200", False, "No threadId in inbox")
-                test("Thread response has messages", False, "No threadId in inbox")
-        else:
-            test("GET /threads/{tid} returns 200", False, "Empty inbox")
-            test("Thread response has messages", False, "Empty inbox")
+        # Test with empty body
+        resp = requests.post(f"{BASE_URL}/gmail/push", json={}, timeout=10)
+        data = resp.json()
+        
+        ok = data.get("ok")
+        
+        success = resp.status_code == 200 and ok == True
+        
+        log_test("POST /gmail/push webhook returns 200 {ok:true} for empty body", success,
+                f"Status: {resp.status_code}, ok: {ok}")
+        check_no_secrets(data, "gmail/push endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /threads/{tid} returns 200", False, str(e))
-        test("Thread response has messages", False, str(e))
-else:
-    test("GET /threads/{tid} returns 200", False, "No token")
-    test("Thread response has messages", False, "No token")
+        log_test("POST /gmail/push webhook returns 200 {ok:true} for empty body", False, str(e))
+        return False
 
-# Test thread not found
-if token:
+def test_email_compose_sent(token: str):
+    """Test 5.1: POST /api/emails/compose (sent email with cc/bcc/attachments)"""
     try:
-        r = httpx.get(f"{BASE_URL}/threads/nonexistent-thread-id", headers=auth_headers(token), timeout=30)
-        test("GET /threads/{invalid} returns 404", r.status_code == 404, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /threads/{invalid} returns 404", False, str(e))
-else:
-    test("GET /threads/{invalid} returns 404", False, "No token")
-
-print()
-
-# ============================================================================
-# 11. COMPOSE SEND/DRAFT/REPLY/FORWARD/DELETE/TRASH WITH CC/BCC/ATTACHMENTS
-# ============================================================================
-print("11. COMPOSE SEND/DRAFT/REPLY/FORWARD/DELETE/TRASH WITH CC/BCC/ATTACHMENTS")
-print("-" * 80)
-
-compose_id = None
-if token:
-    # Test compose with cc/bcc/attachments
-    try:
-        r = httpx.post(f"{BASE_URL}/emails/compose", headers=auth_headers(token), json={
-            "to": "test@example.com",
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "to": "recipient@example.com",
             "subject": "Test Email with Cc/Bcc",
-            "body": "This is a test email.",
+            "body": "This is a test email body.",
             "cc": "cc@example.com",
             "bcc": "bcc@example.com",
-            "attachments": [{"name": "test.pdf", "type": "pdf", "size": "100KB", "data": "base64data"}],
+            "attachments": [],
             "draft": False
-        }, timeout=30)
-        test("POST /emails/compose with cc/bcc/attachments returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            test("Compose stores cc field", data.get("cc") == "cc@example.com", f"Got: {data.get('cc')}")
-            test("Compose stores bcc field", data.get("bcc") == "bcc@example.com", f"Got: {data.get('bcc')}")
-            test("Compose stores attachments", len(data.get("attachments", [])) == 1, f"Got: {data.get('attachments')}")
-            test("Compose sets folder to sent", data.get("folder") == "sent", f"Got: {data.get('folder')}")
-            compose_id = data.get("threadId")
+        }
+        
+        resp = requests.post(f"{BASE_URL}/emails/compose", json=payload, headers=headers, timeout=10)
+        data = resp.json()
+        
+        folder = data.get("folder")
+        has_cc = data.get("cc") == "cc@example.com"
+        has_bcc = data.get("bcc") == "bcc@example.com"
+        
+        success = resp.status_code == 200 and folder == "sent" and has_cc and has_bcc
+        
+        log_test("POST /emails/compose (sent) returns folder='sent' with cc/bcc", success,
+                f"Status: {resp.status_code}, folder: {folder}, cc: {data.get('cc')}, bcc: {data.get('bcc')}")
+        check_no_secrets(data, "emails/compose endpoint")
+        
+        return data.get("threadId") if success else None
     except Exception as e:
-        test("POST /emails/compose with cc/bcc/attachments returns 200", False, str(e))
-        test("Compose stores cc field", False, str(e))
-        test("Compose stores bcc field", False, str(e))
-        test("Compose stores attachments", False, str(e))
-        test("Compose sets folder to sent", False, str(e))
+        log_test("POST /emails/compose (sent) returns folder='sent' with cc/bcc", False, str(e))
+        return None
 
-    # Test draft compose
-    draft_id = None
+def test_email_compose_draft(token: str):
+    """Test 5.2: POST /api/emails/compose (draft)"""
     try:
-        r = httpx.post(f"{BASE_URL}/emails/compose", headers=auth_headers(token), json={
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
             "to": "draft@example.com",
-            "subject": "Draft Email",
-            "body": "This is a draft.",
+            "subject": "Test Draft Email",
+            "body": "This is a draft email.",
+            "cc": "",
+            "bcc": "",
+            "attachments": [],
             "draft": True
-        }, timeout=30)
-        test("POST /emails/compose with draft=true returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            test("Draft sets folder to drafts", data.get("folder") == "drafts", f"Got: {data.get('folder')}")
-            draft_id = data.get("threadId")
+        }
+        
+        resp = requests.post(f"{BASE_URL}/emails/compose", json=payload, headers=headers, timeout=10)
+        data = resp.json()
+        
+        folder = data.get("folder")
+        
+        success = resp.status_code == 200 and folder == "drafts"
+        
+        log_test("POST /emails/compose (draft) returns folder='drafts'", success,
+                f"Status: {resp.status_code}, folder: {folder}")
+        check_no_secrets(data, "emails/compose draft endpoint")
+        
+        return data.get("threadId") if success else None
     except Exception as e:
-        test("POST /emails/compose with draft=true returns 200", False, str(e))
-        test("Draft sets folder to drafts", False, str(e))
+        log_test("POST /emails/compose (draft) returns folder='drafts'", False, str(e))
+        return None
 
-    # Test draft appears in drafts folder
-    if draft_id:
-        try:
-            r = httpx.get(f"{BASE_URL}/emails?folder=drafts", headers=auth_headers(token), timeout=30)
-            drafts = r.json()
-            test("Draft appears in GET /emails?folder=drafts", any(d.get("threadId") == draft_id for d in drafts), f"Draft ID {draft_id} not in drafts")
-        except Exception as e:
-            test("Draft appears in GET /emails?folder=drafts", False, str(e))
-
-    # Test delete email (move to trash)
-    if compose_id:
-        try:
-            r = httpx.delete(f"{BASE_URL}/emails/{compose_id}", headers=auth_headers(token), timeout=30)
-            test("DELETE /emails/{tid} first time returns 200", r.status_code == 200, f"Got {r.status_code}")
-            test("DELETE returns ok=true", r.json().get("ok") == True, f"Got: {r.json()}")
-        except Exception as e:
-            test("DELETE /emails/{tid} first time returns 200", False, str(e))
-            test("DELETE returns ok=true", False, str(e))
-
-        # Verify moved to trash
-        try:
-            r = httpx.get(f"{BASE_URL}/emails?folder=trash", headers=auth_headers(token), timeout=30)
-            trash = r.json()
-            test("Deleted email appears in trash", any(e.get("threadId") == compose_id for e in trash), f"Thread {compose_id} not in trash")
-        except Exception as e:
-            test("Deleted email appears in trash", False, str(e))
-
-        # Test permanent delete (second delete)
-        try:
-            r = httpx.delete(f"{BASE_URL}/emails/{compose_id}", headers=auth_headers(token), timeout=30)
-            test("DELETE /emails/{tid} second time returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("DELETE /emails/{tid} second time returns 200", False, str(e))
-
-        # Verify permanently deleted
-        try:
-            r = httpx.get(f"{BASE_URL}/emails?folder=trash", headers=auth_headers(token), timeout=30)
-            trash = r.json()
-            test("Permanently deleted email not in trash", not any(e.get("threadId") == compose_id for e in trash), f"Thread {compose_id} still in trash")
-        except Exception as e:
-            test("Permanently deleted email not in trash", False, str(e))
-
-    # Test PATCH email (star, important, read, folder)
-    if thread_id:
-        try:
-            r = httpx.patch(f"{BASE_URL}/emails/{thread_id}", headers=auth_headers(token), json={"star": True, "important": True}, timeout=30)
-            test("PATCH /emails/{tid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-            test("PATCH returns updated fields", r.json().get("star") == True and r.json().get("important") == True, f"Got: {r.json()}")
-        except Exception as e:
-            test("PATCH /emails/{tid} returns 200", False, str(e))
-            test("PATCH returns updated fields", False, str(e))
-else:
-    for _ in range(15):
-        test("Compose/draft/delete endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 12. AI COMPOSE/REPLY/UNDERSTAND/ASK/HISTORY/EMAIL-TO-TASK/FILE-SUMMARY
-# ============================================================================
-print("12. AI COMPOSE/REPLY/UNDERSTAND/ASK/HISTORY/EMAIL-TO-TASK/FILE-SUMMARY")
-print("-" * 80)
-
-if token:
-    # Test AI compose
+def test_email_list_drafts(token: str):
+    """Test 5.3: GET /api/emails?folder=drafts"""
     try:
-        r = httpx.post(f"{BASE_URL}/ai/compose", headers=auth_headers(token), json={
-            "instruction": "Write a thank you email to the team",
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/emails", params={"folder": "drafts"}, 
+                           headers=headers, timeout=10)
+        data = resp.json()
+        
+        is_array = isinstance(data, list)
+        
+        success = resp.status_code == 200 and is_array
+        
+        log_test("GET /emails?folder=drafts returns array", success,
+                f"Status: {resp.status_code}, is_array: {is_array}, count: {len(data) if is_array else 0}")
+        check_no_secrets(data, "emails list drafts endpoint")
+        
+        return success
+    except Exception as e:
+        log_test("GET /emails?folder=drafts returns array", False, str(e))
+        return False
+
+def test_email_list_inbox(token: str):
+    """Test 5.4: GET /api/emails?folder=inbox"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/emails", params={"folder": "inbox"}, 
+                           headers=headers, timeout=10)
+        data = resp.json()
+        
+        is_array = isinstance(data, list)
+        
+        success = resp.status_code == 200 and is_array
+        
+        log_test("GET /emails?folder=inbox returns array", success,
+                f"Status: {resp.status_code}, is_array: {is_array}, count: {len(data) if is_array else 0}")
+        check_no_secrets(data, "emails list inbox endpoint")
+        
+        # Return first thread ID for further testing
+        return data[0].get("threadId") if is_array and len(data) > 0 else None
+    except Exception as e:
+        log_test("GET /emails?folder=inbox returns array", False, str(e))
+        return None
+
+def test_thread_read(token: str, thread_id: str):
+    """Test 5.5: GET /api/threads/{threadId}"""
+    if not thread_id:
+        log_test("GET /threads/{threadId} works", False, "No thread ID available")
+        return False
+    
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(f"{BASE_URL}/threads/{thread_id}", headers=headers, timeout=10)
+        data = resp.json()
+        
+        has_thread_id = "threadId" in data
+        has_messages = "messages" in data
+        
+        success = resp.status_code == 200 and has_thread_id and has_messages
+        
+        log_test("GET /threads/{threadId} works", success,
+                f"Status: {resp.status_code}, has_threadId: {has_thread_id}, has_messages: {has_messages}")
+        check_no_secrets(data, "threads read endpoint")
+        
+        return success
+    except Exception as e:
+        log_test("GET /threads/{threadId} works", False, str(e))
+        return False
+
+def test_email_patch(token: str, thread_id: str):
+    """Test 5.6: PATCH /api/emails/{threadId} (star and important)"""
+    if not thread_id:
+        log_test("PATCH /emails/{threadId} updates star/important", False, "No thread ID available")
+        return False
+    
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # Test star
+        payload = {"star": True}
+        resp = requests.patch(f"{BASE_URL}/emails/{thread_id}", json=payload, 
+                             headers=headers, timeout=10)
+        data = resp.json()
+        
+        star_ok = resp.status_code == 200 and data.get("ok") == True
+        
+        # Test important
+        payload = {"important": True}
+        resp = requests.patch(f"{BASE_URL}/emails/{thread_id}", json=payload, 
+                             headers=headers, timeout=10)
+        data = resp.json()
+        
+        important_ok = resp.status_code == 200 and data.get("ok") == True
+        
+        success = star_ok and important_ok
+        
+        log_test("PATCH /emails/{threadId} updates star/important", success,
+                f"star_ok: {star_ok}, important_ok: {important_ok}")
+        check_no_secrets(data, "emails patch endpoint")
+        
+        return success
+    except Exception as e:
+        log_test("PATCH /emails/{threadId} updates star/important", False, str(e))
+        return False
+
+def test_email_delete(token: str, thread_id: str):
+    """Test 5.7: DELETE /api/emails/{threadId} (trash then permanent)"""
+    if not thread_id:
+        log_test("DELETE /emails/{threadId} moves to trash then deletes", False, "No thread ID available")
+        return False
+    
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        
+        # First delete - should move to trash
+        resp = requests.delete(f"{BASE_URL}/emails/{thread_id}", headers=headers, timeout=10)
+        data = resp.json()
+        
+        first_ok = resp.status_code == 200 and data.get("ok") == True
+        
+        # Second delete - should permanently delete
+        resp = requests.delete(f"{BASE_URL}/emails/{thread_id}", headers=headers, timeout=10)
+        data = resp.json()
+        
+        second_ok = resp.status_code == 200 and data.get("ok") == True
+        
+        # Verify not in trash list
+        resp = requests.get(f"{BASE_URL}/emails", params={"folder": "trash"}, 
+                           headers=headers, timeout=10)
+        trash_list = resp.json()
+        
+        not_in_trash = not any(email.get("threadId") == thread_id for email in trash_list)
+        
+        success = first_ok and second_ok and not_in_trash
+        
+        log_test("DELETE /emails/{threadId} moves to trash then deletes permanently", success,
+                f"first_delete_ok: {first_ok}, second_delete_ok: {second_ok}, not_in_trash: {not_in_trash}")
+        check_no_secrets(data, "emails delete endpoint")
+        
+        return success
+    except Exception as e:
+        log_test("DELETE /emails/{threadId} moves to trash then deletes permanently", False, str(e))
+        return False
+
+def test_ai_compose(token: str):
+    """Test 6.1: POST /api/ai/compose"""
+    try:
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "instruction": "Write an email asking for a meeting next week",
             "tone": "Professional"
-        }, timeout=60)
-        test("POST /ai/compose returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            test("AI compose returns subject", "subject" in data, f"Keys: {list(data.keys())}")
-            test("AI compose returns body", "body" in data, f"Keys: {list(data.keys())}")
+        }
+        
+        resp = requests.post(f"{BASE_URL}/ai/compose", json=payload, headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_subject = "subject" in data
+        has_body = "body" in data
+        
+        success = resp.status_code == 200 and has_subject and has_body
+        
+        log_test("POST /ai/compose returns {subject, body}", success,
+                f"Status: {resp.status_code}, has_subject: {has_subject}, has_body: {has_body}")
+        check_no_secrets(data, "ai/compose endpoint")
+        
+        return success
     except Exception as e:
-        test("POST /ai/compose returns 200", False, str(e))
-        test("AI compose returns subject", False, str(e))
-        test("AI compose returns body", False, str(e))
+        log_test("POST /ai/compose returns {subject, body}", False, str(e))
+        return False
 
-    # Test AI reply
-    if thread_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/ai/reply", headers=auth_headers(token), json={
-                "threadId": thread_id,
-                "tone": "Friendly",
-                "action": "reply"
-            }, timeout=60)
-            test("POST /ai/reply returns 200", r.status_code == 200, f"Got {r.status_code}")
-            test("AI reply returns text", "text" in r.json(), f"Keys: {list(r.json().keys())}")
-        except Exception as e:
-            test("POST /ai/reply returns 200", False, str(e))
-            test("AI reply returns text", False, str(e))
-
-    # Test AI understand
-    if thread_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/ai/understand/{thread_id}", headers=auth_headers(token), timeout=60)
-            test("POST /ai/understand/{tid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-            if r.status_code == 200:
-                data = r.json()
-                test("AI understand returns intent", "intent" in data, f"Keys: {list(data.keys())}")
-        except Exception as e:
-            test("POST /ai/understand/{tid} returns 200", False, str(e))
-            test("AI understand returns intent", False, str(e))
-
-    # Test AI thread
-    if thread_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/ai/thread/{thread_id}", headers=auth_headers(token), timeout=60)
-            test("POST /ai/thread/{tid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-            if r.status_code == 200:
-                data = r.json()
-                test("AI thread returns summary", "summary" in data, f"Keys: {list(data.keys())}")
-        except Exception as e:
-            test("POST /ai/thread/{tid} returns 200", False, str(e))
-            test("AI thread returns summary", False, str(e))
-
-    # Test AI ask
+def test_ai_reply(token: str, thread_id: str):
+    """Test 6.2: POST /api/ai/reply"""
+    if not thread_id:
+        log_test("POST /ai/reply returns {text}", False, "No thread ID available")
+        return False
+    
     try:
-        r = httpx.post(f"{BASE_URL}/ai/ask", headers=auth_headers(token), json={"question": "What are my urgent tasks?"}, timeout=60)
-        test("POST /ai/ask returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("AI ask returns answer", "answer" in r.json(), f"Keys: {list(r.json().keys())}")
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "threadId": thread_id,
+            "tone": "Professional",
+            "action": "reply"
+        }
+        
+        resp = requests.post(f"{BASE_URL}/ai/reply", json=payload, headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_text = "text" in data
+        
+        success = resp.status_code == 200 and has_text
+        
+        log_test("POST /ai/reply returns {text}", success,
+                f"Status: {resp.status_code}, has_text: {has_text}")
+        check_no_secrets(data, "ai/reply endpoint")
+        
+        return success
     except Exception as e:
-        test("POST /ai/ask returns 200", False, str(e))
-        test("AI ask returns answer", False, str(e))
+        log_test("POST /ai/reply returns {text}", False, str(e))
+        return False
 
-    # Test AI chat history
+def test_ai_understand(token: str, thread_id: str):
+    """Test 6.3: POST /api/ai/understand/{tid}"""
+    if not thread_id:
+        log_test("POST /ai/understand/{tid} returns intent/topic", False, "No thread ID available")
+        return False
+    
     try:
-        r = httpx.get(f"{BASE_URL}/ai/chat-history", headers=auth_headers(token), timeout=30)
-        test("GET /ai/chat-history returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Chat history returns array", isinstance(r.json(), list), f"Got type: {type(r.json())}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/ai/understand/{thread_id}", headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_intent = "intent" in data
+        has_topic = "topic" in data
+        
+        success = resp.status_code == 200 and has_intent and has_topic
+        
+        log_test("POST /ai/understand/{tid} returns intent/topic", success,
+                f"Status: {resp.status_code}, has_intent: {has_intent}, has_topic: {has_topic}")
+        check_no_secrets(data, "ai/understand endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /ai/chat-history returns 200", False, str(e))
-        test("Chat history returns array", False, str(e))
+        log_test("POST /ai/understand/{tid} returns intent/topic", False, str(e))
+        return False
 
-    # Test AI email-to-task
-    if thread_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/ai/email-to-task/{thread_id}", headers=auth_headers(token), timeout=60)
-            test("POST /ai/email-to-task/{tid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-            if r.status_code == 200:
-                data = r.json()
-                test("Email-to-task returns task with title", "title" in data, f"Keys: {list(data.keys())}")
-        except Exception as e:
-            test("POST /ai/email-to-task/{tid} returns 200", False, str(e))
-            test("Email-to-task returns task with title", False, str(e))
-
-    # Test AI file-summary (need to create a file first)
-    file_id = None
+def test_ai_thread_summary(token: str, thread_id: str):
+    """Test 6.4: POST /api/ai/thread/{tid}"""
+    if not thread_id:
+        log_test("POST /ai/thread/{tid} returns summary", False, "No thread ID available")
+        return False
+    
     try:
-        r = httpx.post(f"{BASE_URL}/files", headers=auth_headers(token), data={
-            "name": "test_document.pdf",
-            "type": "pdf",
-            "size": "100KB",
-            "data": base64.b64encode(b"test file content").decode()
-        }, timeout=30)
-        if r.status_code == 200:
-            file_id = r.json().get("id")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/ai/thread/{thread_id}", headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_summary = "summary" in data
+        
+        success = resp.status_code == 200 and has_summary
+        
+        log_test("POST /ai/thread/{tid} returns summary", success,
+                f"Status: {resp.status_code}, has_summary: {has_summary}")
+        check_no_secrets(data, "ai/thread endpoint")
+        
+        return success
     except Exception as e:
-        pass
+        log_test("POST /ai/thread/{tid} returns summary", False, str(e))
+        return False
 
-    if file_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/ai/file-summary/{file_id}", headers=auth_headers(token), timeout=60)
-            test("POST /ai/file-summary/{fid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-            test("File summary returns summary", "summary" in r.json(), f"Keys: {list(r.json().keys())}")
-        except Exception as e:
-            test("POST /ai/file-summary/{fid} returns 200", False, str(e))
-            test("File summary returns summary", False, str(e))
-    else:
-        test("POST /ai/file-summary/{fid} returns 200", False, "Could not create test file")
-        test("File summary returns summary", False, "Could not create test file")
-else:
-    for _ in range(18):
-        test("AI endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 13. DASHBOARD
-# ============================================================================
-print("13. DASHBOARD")
-print("-" * 80)
-
-if token:
+def test_ai_ask(token: str):
+    """Test 6.5: POST /api/ai/ask"""
     try:
-        r = httpx.get(f"{BASE_URL}/dashboard", headers=auth_headers(token), timeout=30)
-        test("GET /dashboard returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            test("Dashboard returns brief", "brief" in data, f"Keys: {list(data.keys())}")
-            test("Dashboard returns counts", "counts" in data, f"Keys: {list(data.keys())}")
-            test("Dashboard returns tasks", "tasks" in data, f"Keys: {list(data.keys())}")
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "question": "What emails do I need to respond to?"
+        }
+        
+        resp = requests.post(f"{BASE_URL}/ai/ask", json=payload, headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_answer = "answer" in data
+        
+        success = resp.status_code == 200 and has_answer
+        
+        log_test("POST /ai/ask returns {answer}", success,
+                f"Status: {resp.status_code}, has_answer: {has_answer}")
+        check_no_secrets(data, "ai/ask endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /dashboard returns 200", False, str(e))
-        test("Dashboard returns brief", False, str(e))
-        test("Dashboard returns counts", False, str(e))
-        test("Dashboard returns tasks", False, str(e))
-else:
-    test("GET /dashboard returns 200", False, "No token")
-    test("Dashboard returns brief", False, "No token")
-    test("Dashboard returns counts", False, "No token")
-    test("Dashboard returns tasks", False, "No token")
+        log_test("POST /ai/ask returns {answer}", False, str(e))
+        return False
 
-print()
-
-# ============================================================================
-# 14. TASKS/EVENTS/CONTACTS/FILES CRUD
-# ============================================================================
-print("14. TASKS/EVENTS/CONTACTS/FILES CRUD")
-print("-" * 80)
-
-task_id = None
-if token:
-    # Tasks
+def test_ai_email_to_task(token: str, thread_id: str):
+    """Test 6.6: POST /api/ai/email-to-task/{tid}"""
+    if not thread_id:
+        log_test("POST /ai/email-to-task/{tid} returns task with title", False, "No thread ID available")
+        return False
+    
     try:
-        r = httpx.get(f"{BASE_URL}/tasks", headers=auth_headers(token), timeout=30)
-        test("GET /tasks returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("GET /tasks returns array", isinstance(r.json(), list), f"Got type: {type(r.json())}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.post(f"{BASE_URL}/ai/email-to-task/{thread_id}", headers=headers, timeout=30)
+        data = resp.json()
+        
+        has_title = "title" in data
+        
+        success = resp.status_code == 200 and has_title
+        
+        log_test("POST /ai/email-to-task/{tid} returns task with title", success,
+                f"Status: {resp.status_code}, has_title: {has_title}")
+        check_no_secrets(data, "ai/email-to-task endpoint")
+        
+        return success
     except Exception as e:
-        test("GET /tasks returns 200", False, str(e))
-        test("GET /tasks returns array", False, str(e))
+        log_test("POST /ai/email-to-task/{tid} returns task with title", False, str(e))
+        return False
 
+def test_push_register_short_token(token: str):
+    """Test 7.1: POST /api/push/register with short token (<20 chars)"""
     try:
-        r = httpx.post(f"{BASE_URL}/tasks", headers=auth_headers(token), json={
-            "title": "Test Task",
-            "priority": "high",
-            "labels": ["Test"]
-        }, timeout=30)
-        test("POST /tasks returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            task_id = r.json().get("id")
-            test("POST /tasks returns task with id", task_id is not None, f"Got: {r.json()}")
-    except Exception as e:
-        test("POST /tasks returns 200", False, str(e))
-        test("POST /tasks returns task with id", False, str(e))
-
-    if task_id:
-        try:
-            r = httpx.delete(f"{BASE_URL}/tasks/{task_id}", headers=auth_headers(token), timeout=30)
-            test("DELETE /tasks/{tid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("DELETE /tasks/{tid} returns 200", False, str(e))
-
-    # Events
-    try:
-        r = httpx.get(f"{BASE_URL}/events", headers=auth_headers(token), timeout=30)
-        test("GET /events returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /events returns 200", False, str(e))
-
-    try:
-        r = httpx.post(f"{BASE_URL}/events", headers=auth_headers(token), json={
-            "title": "Test Event",
-            "start": "2026-12-01T10:00:00Z"
-        }, timeout=30)
-        test("POST /events returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            event_id = r.json().get("id")
-            if event_id:
-                r2 = httpx.delete(f"{BASE_URL}/events/{event_id}", headers=auth_headers(token), timeout=30)
-                test("DELETE /events/{eid} returns 200", r2.status_code == 200, f"Got {r2.status_code}")
-    except Exception as e:
-        test("POST /events returns 200", False, str(e))
-
-    # Contacts
-    try:
-        r = httpx.get(f"{BASE_URL}/contacts", headers=auth_headers(token), timeout=30)
-        test("GET /contacts returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /contacts returns 200", False, str(e))
-
-    try:
-        r = httpx.post(f"{BASE_URL}/contacts", headers=auth_headers(token), json={
-            "name": "Test Contact",
-            "email": "testcontact@example.com"
-        }, timeout=30)
-        test("POST /contacts returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("POST /contacts returns 200", False, str(e))
-
-    # Files
-    try:
-        r = httpx.get(f"{BASE_URL}/files", headers=auth_headers(token), timeout=30)
-        test("GET /files returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /files returns 200", False, str(e))
-
-    # Test file upload validation (size limit)
-    try:
-        large_data = base64.b64encode(b"x" * (13 * 1024 * 1024)).decode()  # 13MB
-        r = httpx.post(f"{BASE_URL}/files", headers=auth_headers(token), data={
-            "name": "large_file.pdf",
-            "type": "pdf",
-            "size": "13MB",
-            "data": large_data
-        }, timeout=30)
-        test("POST /files with >8MB returns 413", r.status_code == 413, f"Got {r.status_code}")
-    except Exception as e:
-        test("POST /files with >8MB returns 413", False, str(e))
-
-    # Test file download isolation
-    try:
-        r = httpx.get(f"{BASE_URL}/files/nonexistent-file-id/download", headers=auth_headers(token), timeout=30)
-        test("GET /files/{invalid}/download returns 404", r.status_code == 404, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /files/{invalid}/download returns 404", False, str(e))
-else:
-    for _ in range(13):
-        test("CRUD endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 15. MEMORY/SPACES/DECISIONS/COMMITMENTS/FOLLOWUPS/AUDIT/NOTIFICATIONS
-# ============================================================================
-print("15. MEMORY/SPACES/DECISIONS/COMMITMENTS/FOLLOWUPS/AUDIT/NOTIFICATIONS")
-print("-" * 80)
-
-if token:
-    try:
-        r = httpx.get(f"{BASE_URL}/memory", headers=auth_headers(token), timeout=30)
-        test("GET /memory returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /memory returns 200", False, str(e))
-
-    try:
-        r = httpx.post(f"{BASE_URL}/memory", headers=auth_headers(token), json={
-            "kind": "Person",
-            "title": "Test Person",
-            "detail": "Test detail"
-        }, timeout=30)
-        test("POST /memory returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("POST /memory returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/spaces", headers=auth_headers(token), timeout=30)
-        test("GET /spaces returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /spaces returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/decisions", headers=auth_headers(token), timeout=30)
-        test("GET /decisions returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /decisions returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/commitments", headers=auth_headers(token), timeout=30)
-        test("GET /commitments returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /commitments returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/followups", headers=auth_headers(token), timeout=30)
-        test("GET /followups returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /followups returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/audit", headers=auth_headers(token), timeout=30)
-        test("GET /audit returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /audit returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/notifications", headers=auth_headers(token), timeout=30)
-        test("GET /notifications returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /notifications returns 200", False, str(e))
-else:
-    for _ in range(8):
-        test("Memory/spaces/etc endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 16. MEETINGS CREATE/GET/SHARE/NOTES/ASK
-# ============================================================================
-print("16. MEETINGS CREATE/GET/SHARE/NOTES/ASK")
-print("-" * 80)
-
-meeting_id = None
-if token:
-    try:
-        r = httpx.get(f"{BASE_URL}/meetings", headers=auth_headers(token), timeout=30)
-        test("GET /meetings returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200 and len(r.json()) > 0:
-            meeting_id = r.json()[0].get("id")
-    except Exception as e:
-        test("GET /meetings returns 200", False, str(e))
-
-    try:
-        r = httpx.post(f"{BASE_URL}/meetings", headers=auth_headers(token), json={
-            "title": "Test Meeting",
-            "mode": "General"
-        }, timeout=30)
-        test("POST /meetings returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            meeting_id = r.json().get("id")
-    except Exception as e:
-        test("POST /meetings returns 200", False, str(e))
-
-    if meeting_id:
-        try:
-            r = httpx.get(f"{BASE_URL}/meetings/{meeting_id}", headers=auth_headers(token), timeout=30)
-            test("GET /meetings/{mid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("GET /meetings/{mid} returns 200", False, str(e))
-
-        try:
-            r = httpx.post(f"{BASE_URL}/meetings/{meeting_id}/share", headers=auth_headers(token), timeout=30)
-            test("POST /meetings/{mid}/share returns 200", r.status_code == 200, f"Got {r.status_code}")
-            if r.status_code == 200:
-                test("Meeting share returns URL", "url" in r.json(), f"Keys: {list(r.json().keys())}")
-        except Exception as e:
-            test("POST /meetings/{mid}/share returns 200", False, str(e))
-            test("Meeting share returns URL", False, str(e))
-
-        try:
-            r = httpx.post(f"{BASE_URL}/meetings/{meeting_id}/notes", headers=auth_headers(token), timeout=60)
-            test("POST /meetings/{mid}/notes returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("POST /meetings/{mid}/notes returns 200", False, str(e))
-
-        try:
-            r = httpx.post(f"{BASE_URL}/meetings/{meeting_id}/ask", headers=auth_headers(token), json={
-                "question": "What was discussed?"
-            }, timeout=60)
-            test("POST /meetings/{mid}/ask returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("POST /meetings/{mid}/ask returns 200", False, str(e))
-    else:
-        for _ in range(5):
-            test("Meeting endpoint", False, "No meeting ID")
-else:
-    for _ in range(7):
-        test("Meeting endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 17. AGENTS/REPRESENTATIVE
-# ============================================================================
-print("17. AGENTS/REPRESENTATIVE")
-print("-" * 80)
-
-if token:
-    try:
-        r = httpx.get(f"{BASE_URL}/agents/marketplace", headers=auth_headers(token), timeout=30)
-        test("GET /agents/marketplace returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Marketplace returns array", isinstance(r.json(), list), f"Got type: {type(r.json())}")
-    except Exception as e:
-        test("GET /agents/marketplace returns 200", False, str(e))
-        test("Marketplace returns array", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/agents/installed", headers=auth_headers(token), timeout=30)
-        test("GET /agents/installed returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /agents/installed returns 200", False, str(e))
-
-    # Test install agent
-    agent_id = None
-    try:
-        r = httpx.post(f"{BASE_URL}/agents/install", headers=auth_headers(token), json={
-            "name": "Test Agent",
-            "desc": "Test agent description"
-        }, timeout=30)
-        test("POST /agents/install returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            agent_id = r.json().get("id")
-    except Exception as e:
-        test("POST /agents/install returns 200", False, str(e))
-
-    if agent_id:
-        try:
-            r = httpx.post(f"{BASE_URL}/agents/{agent_id}/toggle", headers=auth_headers(token), timeout=30)
-            test("POST /agents/{aid}/toggle returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("POST /agents/{aid}/toggle returns 200", False, str(e))
-
-        try:
-            r = httpx.delete(f"{BASE_URL}/agents/{agent_id}", headers=auth_headers(token), timeout=30)
-            test("DELETE /agents/{aid} returns 200", r.status_code == 200, f"Got {r.status_code}")
-        except Exception as e:
-            test("DELETE /agents/{aid} returns 200", False, str(e))
-
-    try:
-        r = httpx.get(f"{BASE_URL}/representative", headers=auth_headers(token), timeout=30)
-        test("GET /representative returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("GET /representative returns 200", False, str(e))
-
-    try:
-        r = httpx.put(f"{BASE_URL}/representative", headers=auth_headers(token), json={
-            "mode": "AI Representative",
-            "instructions": "Test instructions"
-        }, timeout=30)
-        test("PUT /representative returns 200", r.status_code == 200, f"Got {r.status_code}")
-    except Exception as e:
-        test("PUT /representative returns 200", False, str(e))
-else:
-    for _ in range(8):
-        test("Agent/representative endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 18. VOICE/TRANSLATION INCLUDING FRIENDLY FAILURE CASES
-# ============================================================================
-print("18. VOICE/TRANSLATION INCLUDING FRIENDLY FAILURE CASES")
-print("-" * 80)
-
-if token:
-    # Test transcribe with empty audio
-    try:
-        empty_file = httpx._multipart.DataField(name="file", value=b"")
-        r = httpx.post(f"{BASE_URL}/voice/transcribe", headers=auth_headers(token), data={"language_code": "hi-IN", "mode": "codemix"}, files={"file": ("empty.m4a", b"", "audio/mp4")}, timeout=30)
-        test("POST /voice/transcribe with empty audio returns 413", r.status_code == 413, f"Got {r.status_code}")
-        test("Empty audio error is friendly", "empty" in r.text.lower() or "recording" in r.text.lower(), f"Got: {r.text[:200]}")
-    except Exception as e:
-        test("POST /voice/transcribe with empty audio returns 413", False, str(e))
-        test("Empty audio error is friendly", False, str(e))
-
-    # Test translate with valid input
-    try:
-        r = httpx.post(f"{BASE_URL}/translate", headers=auth_headers(token), json={
-            "text": "Hello, how are you?",
-            "source": "en-IN",
-            "target": "hi-IN"
-        }, timeout=30)
-        test("POST /translate returns 200 or friendly error", r.status_code in [200, 502, 503], f"Got {r.status_code}")
-        if r.status_code == 200:
-            test("Translate returns translated text", "translated_text" in r.json() or "output" in r.json(), f"Keys: {list(r.json().keys())}")
-    except Exception as e:
-        test("POST /translate returns 200 or friendly error", False, str(e))
-        test("Translate returns translated text", False, str(e))
-
-    # Test translate with source==target
-    try:
-        r = httpx.post(f"{BASE_URL}/translate", headers=auth_headers(token), json={
-            "text": "Hello",
-            "source": "en-IN",
-            "target": "en-IN"
-        }, timeout=30)
-        test("POST /translate with source==target returns 400", r.status_code == 400, f"Got {r.status_code}")
-    except Exception as e:
-        test("POST /translate with source==target returns 400", False, str(e))
-else:
-    for _ in range(5):
-        test("Voice/translation endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 19. GOOGLE/GMAIL/FCM/ANALYTICS/FEEDBACK ENDPOINTS WITH MISSING CREDENTIALS
-# ============================================================================
-print("19. GOOGLE/GMAIL/FCM/ANALYTICS/FEEDBACK ENDPOINTS WITH MISSING CREDENTIALS")
-print("-" * 80)
-
-if token:
-    # Test Google config
-    try:
-        r = httpx.get(f"{BASE_URL}/auth/google/config", timeout=30)
-        test("GET /auth/google/config returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Google config shows configured status", "configured" in r.json(), f"Keys: {list(r.json().keys())}")
-    except Exception as e:
-        test("GET /auth/google/config returns 200", False, str(e))
-        test("Google config shows configured status", False, str(e))
-
-    # Test Google authorize (should fail gracefully without credentials)
-    try:
-        r = httpx.get(f"{BASE_URL}/auth/google/authorize", headers=auth_headers(token), timeout=30)
-        test("GET /auth/google/authorize returns safe error", r.status_code in [503, 200], f"Got {r.status_code}")
-        if r.status_code == 503:
-            test("Google authorize error is friendly", "not configured" in r.text.lower() or "unavailable" in r.text.lower(), f"Got: {r.text[:200]}")
-    except Exception as e:
-        test("GET /auth/google/authorize returns safe error", False, str(e))
-        test("Google authorize error is friendly", False, str(e))
-
-    # Test Gmail sync (should fail gracefully without connected account)
-    try:
-        r = httpx.post(f"{BASE_URL}/gmail/sync", headers=auth_headers(token), timeout=30)
-        test("POST /gmail/sync returns safe error", r.status_code in [400, 503], f"Got {r.status_code}")
-        test("Gmail sync error is friendly", "connect" in r.text.lower() or "account" in r.text.lower(), f"Got: {r.text[:200]}")
-    except Exception as e:
-        test("POST /gmail/sync returns safe error", False, str(e))
-        test("Gmail sync error is friendly", False, str(e))
-
-    # Test push token registration
-    try:
-        r = httpx.post(f"{BASE_URL}/push/register", headers=auth_headers(token), json={
-            "token": "a" * 50,
-            "platform": "android"
-        }, timeout=30)
-        test("POST /push/register returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Push register returns registered=true", r.json().get("registered") == True, f"Got: {r.json()}")
-    except Exception as e:
-        test("POST /push/register returns 200", False, str(e))
-        test("Push register returns registered=true", False, str(e))
-
-    # Test push token validation (short token)
-    try:
-        r = httpx.post(f"{BASE_URL}/push/register", headers=auth_headers(token), json={
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
             "token": "short",
             "platform": "android"
-        }, timeout=30)
-        test("POST /push/register with short token returns 422", r.status_code == 422, f"Got {r.status_code}")
+        }
+        
+        resp = requests.post(f"{BASE_URL}/push/register", json=payload, headers=headers, timeout=10)
+        
+        success = resp.status_code == 422
+        
+        log_test("POST /push/register with short token returns 422", success,
+                f"Status: {resp.status_code}")
+        check_no_secrets(resp.text, "push/register short token endpoint")
+        
+        return success
     except Exception as e:
-        test("POST /push/register with short token returns 422", False, str(e))
+        log_test("POST /push/register with short token returns 422", False, str(e))
+        return False
 
-    # Test analytics
+def test_push_register_valid_token(token: str):
+    """Test 7.2: POST /api/push/register with valid long token"""
     try:
-        r = httpx.post(f"{BASE_URL}/analytics", headers=auth_headers(token), json={
-            "name": "test_event",
-            "params": {"key": "value"}
-        }, timeout=30)
-        test("POST /analytics returns 200", r.status_code == 200, f"Got {r.status_code}")
-        test("Analytics returns recorded=true", r.json().get("recorded") == True, f"Got: {r.json()}")
+        headers = {"Authorization": f"Bearer {token}"}
+        payload = {
+            "token": "a" * 50,  # Valid long token
+            "platform": "android"
+        }
+        
+        resp = requests.post(f"{BASE_URL}/push/register", json=payload, headers=headers, timeout=10)
+        data = resp.json()
+        
+        registered = data.get("registered")
+        
+        success = resp.status_code == 200 and registered == True
+        
+        log_test("POST /push/register with valid token returns {registered:true}", success,
+                f"Status: {resp.status_code}, registered: {registered}")
+        check_no_secrets(data, "push/register valid token endpoint")
+        
+        return success
     except Exception as e:
-        test("POST /analytics returns 200", False, str(e))
-        test("Analytics returns recorded=true", False, str(e))
+        log_test("POST /push/register with valid token returns {registered:true}", False, str(e))
+        return False
 
-    # Test feedback (should fail gracefully without Resend)
-    try:
-        r = httpx.post(f"{BASE_URL}/feedback", headers=auth_headers(token), json={
-            "message": "Test feedback message",
-            "category": "general"
-        }, timeout=30)
-        test("POST /feedback returns safe error", r.status_code in [503, 200], f"Got {r.status_code}")
-        if r.status_code == 503:
-            test("Feedback error is friendly", "unavailable" in r.text.lower() or "temporarily" in r.text.lower(), f"Got: {r.text[:200]}")
-    except Exception as e:
-        test("POST /feedback returns safe error", False, str(e))
-        test("Feedback error is friendly", False, str(e))
-else:
-    for _ in range(12):
-        test("Google/Gmail/FCM/analytics/feedback endpoint", False, "No token")
-
-print()
-
-# ============================================================================
-# 20. NETWORK/INVALID-AUTH/VALIDATION ERRORS
-# ============================================================================
-print("20. NETWORK/INVALID-AUTH/VALIDATION ERRORS")
-print("-" * 80)
-
-# Test invalid auth on protected endpoint
-try:
-    r = httpx.get(f"{BASE_URL}/dashboard", headers={"Authorization": "Bearer invalid_token"}, timeout=30)
-    test("Protected endpoint with invalid token returns 401", r.status_code == 401, f"Got {r.status_code}")
-except Exception as e:
-    test("Protected endpoint with invalid token returns 401", False, str(e))
-
-# Test validation error on compose (missing required fields)
-if token:
-    try:
-        r = httpx.post(f"{BASE_URL}/emails/compose", headers=auth_headers(token), json={
-            "subject": "Test"
-            # Missing required 'to' and 'body' fields
-        }, timeout=30)
-        test("POST /emails/compose with missing fields returns 422", r.status_code == 422, f"Got {r.status_code}")
-    except Exception as e:
-        test("POST /emails/compose with missing fields returns 422", False, str(e))
-
-# Test search
-if token:
-    try:
-        r = httpx.get(f"{BASE_URL}/search?q=test", headers=auth_headers(token), timeout=30)
-        test("GET /search returns 200", r.status_code == 200, f"Got {r.status_code}")
-        if r.status_code == 200:
-            data = r.json()
-            test("Search returns multiple categories", "emails" in data and "tasks" in data, f"Keys: {list(data.keys())}")
-    except Exception as e:
-        test("GET /search returns 200", False, str(e))
-        test("Search returns multiple categories", False, str(e))
-
-print()
-
-# ============================================================================
-# SUMMARY
-# ============================================================================
-print("=" * 80)
-print("TEST SUMMARY")
-print("=" * 80)
-print(f"Total tests: {passed + failed}")
-print(f"Passed: {passed}")
-print(f"Failed: {failed}")
-print()
-
-if failed > 0:
-    print("FAILURES:")
-    print("-" * 80)
-    for failure in failures:
-        print(f"  ✗ {failure}")
+def main():
+    print("=" * 80)
+    print("FMAIL GMAIL CLIENT BACKEND TEST SUITE")
+    print("=" * 80)
     print()
-    sys.exit(1)
-else:
-    print("✓ ALL TESTS PASSED")
-    sys.exit(0)
+    
+    # Test 1: Root endpoint
+    print("### 1. ROOT ENDPOINT ###")
+    test_root()
+    print()
+    
+    # Test 2: Auth identity removal
+    print("### 2. AUTH IDENTITY REMOVAL ###")
+    test_check_handle_removed()
+    test_signup_no_username()
+    demo_token = test_demo_login()
+    if demo_token:
+        test_auth_me(demo_token)
+    print()
+    
+    # Test 3: Google OAuth endpoints
+    print("### 3. GOOGLE OAUTH ENDPOINTS ###")
+    test_google_config()
+    test_google_login_url()
+    test_google_exchange_invalid()
+    if demo_token:
+        test_google_authorize(demo_token)
+        test_google_disconnect(demo_token)
+    print()
+    
+    # Test 4: Gmail endpoints
+    print("### 4. GMAIL ENDPOINTS (demo has no Gmail) ###")
+    if demo_token:
+        test_gmail_status(demo_token)
+        test_gmail_sync(demo_token)
+        test_gmail_watch(demo_token)
+    test_gmail_push_webhook()
+    print()
+    
+    # Test 5: Email local fallback
+    print("### 5. EMAIL LOCAL FALLBACK (demo account) ###")
+    if demo_token:
+        sent_thread_id = test_email_compose_sent(demo_token)
+        draft_thread_id = test_email_compose_draft(demo_token)
+        test_email_list_drafts(demo_token)
+        inbox_thread_id = test_email_list_inbox(demo_token)
+        
+        # Use inbox thread for further tests
+        test_thread_id = inbox_thread_id or sent_thread_id
+        
+        test_thread_read(demo_token, test_thread_id)
+        test_email_patch(demo_token, test_thread_id)
+        
+        # Use draft thread for delete test (don't delete inbox emails)
+        test_email_delete(demo_token, draft_thread_id)
+    print()
+    
+    # Test 6: AI endpoints
+    print("### 6. AI ENDPOINTS (cached emails) ###")
+    if demo_token:
+        test_ai_compose(demo_token)
+        # Use inbox thread for AI tests
+        ai_thread_id = inbox_thread_id or sent_thread_id
+        test_ai_reply(demo_token, ai_thread_id)
+        test_ai_understand(demo_token, ai_thread_id)
+        test_ai_thread_summary(demo_token, ai_thread_id)
+        test_ai_ask(demo_token)
+        test_ai_email_to_task(demo_token, ai_thread_id)
+    print()
+    
+    # Test 7: Push notifications
+    print("### 7. PUSH NOTIFICATIONS ###")
+    if demo_token:
+        test_push_register_short_token(demo_token)
+        test_push_register_valid_token(demo_token)
+    print()
+    
+    # Summary
+    print("=" * 80)
+    print("TEST SUMMARY")
+    print("=" * 80)
+    print(f"✅ PASSED: {passed}")
+    print(f"❌ FAILED: {failed}")
+    print(f"📊 TOTAL:  {passed + failed}")
+    print()
+    
+    if failures:
+        print("FAILED TESTS:")
+        for failure in failures:
+            print(f"  - {failure}")
+        print()
+    
+    if failed == 0:
+        print("🎉 ALL TESTS PASSED!")
+    else:
+        print(f"⚠️  {failed} test(s) failed. See details above.")
+    
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()

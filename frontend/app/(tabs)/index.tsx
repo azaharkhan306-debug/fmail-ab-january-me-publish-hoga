@@ -40,7 +40,7 @@ export default function Home() {
 
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface }}>
-      <Header title="Fmail" subtitle={user?.fmail} showMenu showSearch />
+      <Header title="Fmail" subtitle={user?.gmailEmail || user?.email} showMenu showSearch />
       {isLoading ? <Loading /> : isError ? <ErrorState onRetry={refetch} /> : (
         <ScrollView
           contentContainerStyle={{ paddingHorizontal: spacing.lg, paddingBottom: 24 }}

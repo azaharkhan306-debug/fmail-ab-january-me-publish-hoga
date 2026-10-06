@@ -6,6 +6,7 @@ import { KeyboardProvider } from "react-native-keyboard-controller";
 import { StatusBar } from "expo-status-bar";
 import { useEffect } from "react";
 import { track } from "@/src/analytics";
+import { setupNotificationTapHandling } from "@/src/notifications";
 
 import { ErrorBoundary } from "@/src/components/error-boundary";
 import { queryClient } from "@/src/query-client";
@@ -16,7 +17,7 @@ LogBox.ignoreAllLogs(true);
 
 export default function RootLayout() {
   const { scheme, colors } = useTheme();
-  useEffect(() => { track("app_open"); }, []);
+  useEffect(() => { track("app_open"); setupNotificationTapHandling(); }, []);
   return (
     <ErrorBoundary>
       <QueryClientProvider client={queryClient}>

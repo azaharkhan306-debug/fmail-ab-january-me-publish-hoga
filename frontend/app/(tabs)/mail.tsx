@@ -4,6 +4,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/src/api";
+import { useAuth } from "@/src/auth";
 import { useTheme, spacing, radius } from "@/src/theme";
 import { Icon, T, Loading, ErrorState, Empty, Avatar, Badge, Chip, Sheet } from "@/src/ui";
 import { Header, ChipRow } from "@/src/screen";
@@ -19,9 +20,6 @@ const FOLDERS: { key: string; label: string; icon: any }[] = [
 ];
 const FILTERS = ["All", "Unread", "Important"];
 const CATEGORIES = ["Work", "Personal", "Finance", "Shopping", "College", "Startup", "Newsletter", "Social"];
-const ACCOUNTS: { key: string; label: string }[] = [
-  { key: "fmail", label: "Fmail" }, { key: "gmail", label: "Gmail" }, { key: "outlook", label: "Outlook" },
-];
 
 const ACCOUNT_ICON: Record<string, string> = { fmail: "at", gmail: "google", outlook: "microsoft-outlook" };
 
@@ -29,6 +27,7 @@ export default function Mail() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { colors } = useTheme();
+  const { user } = useAuth();
   const qc = useQueryClient();
   const [folder, setFolder] = useState("inbox");
   const [filter, setFilter] = useState("All");
@@ -46,6 +45,12 @@ export default function Mail() {
     queryKey: ["emails", folder, filter, category, account],
     queryFn: () => api.get("/emails?" + params.toString()),
   });
+
+  const onRefresh = async () => {
+    // Pull-to-refresh also pulls new mail straight from Gmail.
+    if (user?.gmailConnected) { try { await api.post("/gmail/sync"); } catch {} }
+    await refetch();
+  };
 
   const folderLabel = FOLDERS.find((f) => f.key === folder)?.label || "Inbox";
 
@@ -74,15 +79,26 @@ export default function Mail() {
     </Pressable>
   );
 
+  const ConnectBanner = () => (user?.gmailConnected ? null : (
+    <Pressable testID="connect-gmail-banner" onPress={() => router.push("/gmail")}
+      style={{ flexDirection: "row", alignItems: "center", gap: 12, margin: spacing.lg, padding: spacing.lg, borderRadius: radius.lg, backgroundColor: colors.brandTertiary, borderWidth: 1, borderColor: colors.border }}>
+      <Icon name="google" size={24} color={colors.brandPrimary} />
+      <View style={{ flex: 1 }}>
+        <T size={14} weight="800">Connect your Gmail</T>
+        <T size={12} color={colors.muted}>Bring your real inbox into Fmail to read, send and reply.</T>
+      </View>
+      <Icon name="chevron-right" size={22} color={colors.muted} />
+    </Pressable>
+  ));
+
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface }}>
-      <Header title={folderLabel} subtitle="Universal Inbox" showMenu
+      <Header title={folderLabel} subtitle={user?.gmailEmail || "Gmail inbox"} showMenu
         right={<Pressable onPress={() => setFolderOpen(true)} testID="folder-switch" hitSlop={8}><Icon name="folder-swap-outline" size={24} /></Pressable>} />
 
       <ChipRow>
         {FILTERS.map((f) => <Chip key={f} label={f} active={filter === f} onPress={() => setFilter(f)} testID={`filter-${f.toLowerCase()}`} />)}
         <View style={{ width: 1, height: 22, backgroundColor: colors.border, marginHorizontal: 4 }} />
-        {ACCOUNTS.map((a) => <Chip key={a.key} label={a.label} icon={ACCOUNT_ICON[a.key]} active={account === a.key} onPress={() => setAccount(account === a.key ? null : a.key)} testID={`account-${a.key}`} />)}
         {CATEGORIES.map((c) => <Chip key={c} label={c} active={category === c} onPress={() => setCategory(category === c ? null : c)} testID={`cat-${c.toLowerCase()}`} />)}
       </ChipRow>
 
@@ -91,9 +107,12 @@ export default function Mail() {
           data={data || []}
           keyExtractor={(i) => i.threadId}
           renderItem={renderItem}
-          ListEmptyComponent={<Empty title="Nothing here" subtitle="This view has no messages right now." />}
+          ListHeaderComponent={<ConnectBanner />}
+          ListEmptyComponent={user?.gmailConnected
+            ? <Empty title="Nothing here" subtitle="This view has no messages right now." />
+            : <Empty title="No mail yet" subtitle="Connect your Gmail to see your inbox." />}
           contentContainerStyle={{ paddingBottom: 24, flexGrow: 1 }}
-          refreshControl={<RefreshControl refreshing={isRefetching} onRefresh={refetch} tintColor={colors.brandPrimary} />}
+          refreshControl={<RefreshControl refreshing={isRefetching} onRefresh={onRefresh} tintColor={colors.brandPrimary} />}
         />
       )}
 

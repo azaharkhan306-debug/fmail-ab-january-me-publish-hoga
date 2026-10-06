@@ -1,9 +1,11 @@
 import React, { useState } from "react";
-import { View, Text, ScrollView, Pressable, Alert } from "react-native";
+import { View, Text, ScrollView, Pressable, Alert, Platform, Linking } from "react-native";
+import * as FileSystem from "expo-file-system/legacy";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "@/src/api";
+import { useAuth } from "@/src/auth";
 import { useTheme, spacing, radius } from "@/src/theme";
 import { Icon, T, Card, Button, Loading, ErrorState, Avatar, Badge, Sheet, Field } from "@/src/ui";
 import { Header } from "@/src/screen";
@@ -22,6 +24,7 @@ export default function Thread() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
   const { colors } = useTheme();
+  const { user } = useAuth();
   const qc = useQueryClient();
   const [tab, setTab] = useState<"read" | "understand">("read");
   const [replyOpen, setReplyOpen] = useState(false);
@@ -56,6 +59,37 @@ export default function Thread() {
       subject: "Fwd: " + (data?.subject || ""),
       body: `\n\n---------- Forwarded message ----------\nFrom: ${m?.sender} <${m?.senderEmail}>\n\n${m?.body || ""}`,
     } });
+  };
+
+  const replyAll = () => {
+    const m = data?.messages?.[data.messages.length - 1];
+    const me = (user?.gmailEmail || user?.email || "").toLowerCase();
+    const raw = [m?.senderEmail, m?.to, m?.cc].filter(Boolean).join(",");
+    const everyone = Array.from(new Set(raw.split(/[,;]/).map((x: string) => x.trim()).filter(Boolean)));
+    const to = m?.senderEmail || everyone[0] || "";
+    const cc = everyone.filter((e) => e.toLowerCase() !== me && e.toLowerCase() !== (to || "").toLowerCase()).join(", ");
+    router.push({ pathname: "/compose", params: { to, cc, subject: "Re: " + (data?.subject || ""), threadId: id } });
+  };
+
+  const downloadAttachment = async (messageId: string, att: any) => {
+    if (!messageId || !att?.attachmentId) {
+      return Alert.alert("Attachment", "This attachment is not available to download.");
+    }
+    try {
+      const res = await api.get(`/emails/${messageId}/attachment/${att.attachmentId}`);
+      if (Platform.OS === "web") {
+        await Linking.openURL(`data:${res.type};base64,${res.data}`);
+        return;
+      }
+      const dir = FileSystem.cacheDirectory || FileSystem.documentDirectory;
+      const uri = `${dir}${(att.name || "attachment").replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+      await FileSystem.writeAsStringAsync(uri, res.data, { encoding: "base64" });
+      const can = await Linking.canOpenURL(uri);
+      if (can) await Linking.openURL(uri);
+      else Alert.alert("Downloaded", `${att.name} saved to the app's files.`);
+    } catch (e: any) {
+      Alert.alert("Attachment", e?.message || "Could not download this attachment.");
+    }
   };
 
   if (isLoading) return <View style={{ flex: 1, backgroundColor: colors.surface }}><Header title="Loading…" back showSearch={false} /><Loading /></View>;
@@ -106,6 +140,18 @@ export default function Thread() {
                   <Badge label={m.aiLabel} />
                 </View>
                 <Text style={{ color: colors.onSurface, fontSize: 15, lineHeight: 23 }}>{m.body}</Text>
+                {(m.attachments || []).length ? (
+                  <View style={{ gap: 8, marginTop: 14 }}>
+                    {m.attachments.map((a: any, i: number) => (
+                      <Pressable key={i} testID={`attachment-${m.id}-${i}`} onPress={() => downloadAttachment(m.providerMessageId, a)}
+                        style={{ flexDirection: "row", alignItems: "center", gap: 10, backgroundColor: colors.surfaceSecondary, borderRadius: radius.md, padding: 12, borderWidth: 1, borderColor: colors.border }}>
+                        <Icon name="paperclip" size={18} color={colors.brandPrimary} />
+                        <T size={13} style={{ flex: 1 }} numberOfLines={1}>{a.name}</T>
+                        <Icon name="download" size={18} color={colors.muted} />
+                      </Pressable>
+                    ))}
+                  </View>
+                ) : null}
               </Card>
             ))}
           </>
@@ -149,6 +195,7 @@ export default function Thread() {
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <ActionChip icon="reply" label="AI Reply" onPress={() => setReplyOpen(true)} testID="action-reply" />
           <ActionChip icon="pencil-outline" label="Reply" onPress={() => router.push({ pathname: "/compose", params: { to: data.messages[0]?.senderEmail, subject: "Re: " + data.subject, threadId: id } })} testID="action-reply-manual" />
+          <ActionChip icon="reply-all" label="Reply all" onPress={replyAll} testID="action-reply-all" />
           <ActionChip icon="share-outline" label="Forward" onPress={forward} testID="action-forward" />
           <ActionChip icon="checkbox-marked-circle-plus-outline" label="To Task" onPress={() => toTask.mutate()} loading={toTask.isPending} testID="action-task" />
           <ActionChip icon="calendar-plus" label="Schedule Meeting" onPress={() => router.push({ pathname: "/calendar", params: { new: data.subject } })} testID="action-meeting" />

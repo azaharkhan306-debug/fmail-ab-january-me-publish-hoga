@@ -14,6 +14,8 @@ import base64
 import re
 import asyncio
 import urllib.parse
+from email.message import EmailMessage
+from email.utils import parseaddr
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any
@@ -78,7 +80,20 @@ async def current_user(creds: HTTPAuthorizationCredentials = Depends(security)) 
     user = await db.users.find_one({"id": payload["uid"]}, {"_id": 0, "password": 0})
     if not user:
         raise HTTPException(401, "User not found")
+    acct = await db.gmail_accounts.find_one({"uid": user["id"]}, {"_id": 0, "email": 1, "revoked": 1, "history_id": 1})
+    user["gmailConnected"] = bool(acct) and not (acct or {}).get("revoked", False)
+    user["gmailEmail"] = acct["email"] if acct else None
+    # keep connectedAccounts in sync for UI
+    accounts = [
+        {"provider": "gmail", "email": acct["email"] if acct else "", "connected": user["gmailConnected"]},
+    ]
+    user["connectedAccounts"] = accounts
     return user
+
+
+def _user_addr(user: dict) -> str:
+    """The address Fmail sends/displays as — the connected Gmail, else the login email."""
+    return user.get("gmailEmail") or user.get("email")
 
 
 async def audit(uid: str, action: str, detail: str = "", actor: str = "You"):
@@ -130,8 +145,7 @@ class SignupIn(BaseModel):
     email: EmailStr
     password: str = Field(min_length=6)
     name: str
-    username: str  # fmail handle -> username@fmails.in
-    code: str = Field(min_length=6, max_length=6)
+    code: Optional[str] = None
 
 
 class LoginIn(BaseModel):
@@ -270,7 +284,7 @@ class TranslateIn(BaseModel):
 
 class GoogleSignInIn(BaseModel):
     id_token: str
-    choice: str  # create_fmail | keep_gmail
+    choice: str = "connect"
 
 
 class GoogleConnectIn(BaseModel):
@@ -494,31 +508,28 @@ async def root():
 
 @api.post("/auth/signup")
 async def signup(body: SignupIn):
-    if await db.users.find_one({"email": body.email.lower()}):
+    """Create a Fmail account (email/password). Users connect their real Gmail after signup."""
+    email = body.email.lower()
+    if await db.users.find_one({"email": email}):
         raise HTTPException(400, "An account with this email already exists")
-    handle = body.username.lower().strip().replace(" ", "")
-    if await db.users.find_one({"handle": handle}):
-        raise HTTPException(400, "This Fmail address is already taken. Please choose another one.")
-    if not body.code:
-        raise HTTPException(400, "Please verify your email with the code we sent.")
-    await _verify_code(body.email.lower(), body.code, "signup")
+    # OTP is only enforced when email delivery is configured.
+    if RESEND_API_KEY and RESEND_FROM_EMAIL:
+        if not body.code:
+            raise HTTPException(400, "Please verify your email with the code we sent.")
+        await _verify_code(email, body.code, "signup")
     uid = new_id()
     pw = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
     user = {
-        "id": uid, "email": body.email.lower(), "password": pw, "name": body.name,
-        "handle": handle, "fmail": handle + "@fmails.in", "photo": None, "signature": "Sent with Fmail",
-        "aliases": [], "connectedAccounts": [
-            {"provider": "fmail", "email": handle + "@fmails.in", "connected": True},
-            {"provider": "gmail", "email": "", "connected": False},
-            {"provider": "outlook", "email": "", "connected": False},
-        ],
+        "id": uid, "email": email, "password": pw, "name": body.name,
+        "photo": None, "signature": "Sent with Fmail", "aliases": [],
+        "connectedAccounts": [{"provider": "gmail", "email": "", "connected": False}],
         "permissions": {"notifications": True, "camera": False, "microphone": False, "contacts": False, "storage": False},
         "aiEnabled": True, "memoryEnabled": True, "darkMode": "system",
         "created_at": now_iso(),
     }
     await db.users.insert_one(user)
-    await db.otps.delete_one({"email": body.email.lower(), "purpose": "signup"})
-    await audit(uid, "Account created", f"Fmail identity {handle}@fmails.in")
+    await db.otps.delete_one({"email": email, "purpose": "signup"})
+    await audit(uid, "Account created", email)
     token = make_token(uid)
     user.pop("password"); user.pop("_id", None)
     return {"token": token, "user": user}
@@ -546,20 +557,6 @@ async def update_profile(body: ProfileIn, user: dict = Depends(current_user)):
         await db.users.update_one({"id": user["id"]}, {"$set": updates})
     fresh = await db.users.find_one({"id": user["id"]}, {"_id": 0, "password": 0})
     return fresh
-
-
-@api.get("/auth/check-handle")
-async def check_handle(handle: str):
-    """Real-time, case-insensitive availability of a Fmail address (public)."""
-    h = (handle or "").lower().strip().replace(" ", "")
-    if len(h) < 3:
-        return {"available": False, "reason": "Fmail address must be at least 3 characters."}
-    if not all(c.isalnum() or c in "._-" for c in h):
-        return {"available": False, "reason": "Use only letters, numbers, dot, underscore or hyphen."}
-    existing = await db.users.find_one({"handle": h})
-    if existing:
-        return {"available": False, "reason": "This Fmail address is already taken. Please choose another one."}
-    return {"available": True, "handle": h, "fmail": h + "@fmails.in"}
 
 
 @api.put("/auth/permissions")
@@ -727,21 +724,31 @@ async def _google_userinfo(access_token: str) -> dict:
 
 async def _gmail_access_token(account: dict) -> str:
     expires_at = datetime.fromisoformat(account.get("expires_at", "1970-01-01T00:00:00+00:00"))
-    if expires_at > datetime.now(timezone.utc) + timedelta(minutes=2):
+    if account.get("access_token") and expires_at > datetime.now(timezone.utc) + timedelta(minutes=2):
         return _fernet().decrypt(account["access_token"].encode()).decode()
-    refresh = _fernet().decrypt(account["refresh_token"].encode()).decode()
+    refresh_enc = account.get("refresh_token")
+    if not refresh_enc:
+        await _mark_revoked(account)
+        raise HTTPException(401, "Gmail access expired. Please reconnect your Google account.")
+    refresh = _fernet().decrypt(refresh_enc.encode()).decode()
     async with httpx.AsyncClient(timeout=20) as client:
         response = await client.post("https://oauth2.googleapis.com/token", data={
             "client_id": GOOGLE_CLIENT_ID, "client_secret": GOOGLE_CLIENT_SECRET,
             "refresh_token": refresh, "grant_type": "refresh_token",
         })
     if response.status_code >= 400:
+        await _mark_revoked(account)
         raise HTTPException(401, "Gmail access expired. Please reconnect your Google account.")
     data = response.json()
     account["access_token"] = _fernet().encrypt(data["access_token"].encode()).decode()
     account["expires_at"] = (datetime.now(timezone.utc) + timedelta(seconds=int(data.get("expires_in", 3600)))).isoformat()
-    await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"access_token": account["access_token"], "expires_at": account["expires_at"]}})
+    await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"access_token": account["access_token"], "expires_at": account["expires_at"], "revoked": False}})
     return data["access_token"]
+
+
+async def _mark_revoked(account: dict) -> None:
+    await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"revoked": True}})
+    await db.users.update_one({"id": account["uid"]}, {"$set": {"connectedAccounts.0.connected": False}})
 
 
 @api.get("/auth/google/config")
@@ -749,70 +756,365 @@ async def google_config():
     return {"configured": _google_ready(), "provider": "google", "project": FIREBASE_PROJECT_ID}
 
 
-@api.post("/auth/google/signin")
-async def google_signin(body: GoogleSignInIn):
-    if body.choice not in ("create_fmail", "keep_gmail"):
-        raise HTTPException(400, "Choose whether to create a Fmail identity or keep Gmail.")
-    if not GOOGLE_CLIENT_ID:
-        raise HTTPException(503, "Google sign-in is not configured for this Fmail project.")
+GMAIL_API = "https://gmail.googleapis.com/gmail/v1/users/me"
+GMAIL_SCOPE = "openid email profile https://www.googleapis.com/auth/gmail.modify"
+
+
+def _encrypt(value: str) -> str:
+    return _fernet().encrypt((value or "").encode()).decode()
+
+
+async def _store_gmail_account(uid: str, info: dict, tokens: dict) -> dict:
+    """Create/update a Gmail account record, preserving an existing refresh token if Google omits one."""
+    email = info["email"].lower()
+    existing = await db.gmail_accounts.find_one({"uid": uid, "email": email})
+    refresh = tokens.get("refresh_token")
+    account = {
+        "id": (existing or {}).get("id", new_id()), "uid": uid, "email": email,
+        "access_token": _encrypt(tokens["access_token"]),
+        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(tokens.get("expires_in", 3600)))).isoformat(),
+        "revoked": False, "created_at": (existing or {}).get("created_at", now_iso()),
+        "history_id": (existing or {}).get("history_id"),
+    }
+    if refresh:
+        account["refresh_token"] = _encrypt(refresh)
+    elif existing and existing.get("refresh_token"):
+        account["refresh_token"] = existing["refresh_token"]
+    await db.gmail_accounts.update_one({"uid": uid, "email": email}, {"$set": account}, upsert=True)
+    await db.users.update_one({"id": uid}, {"$set": {"connectedAccounts": [{"provider": "gmail", "email": email, "connected": True}]}})
+    return account
+
+
+def _app_redirect(path: str, **params) -> RedirectResponse:
+    scheme = os.environ.get("EXPO_APP_SCHEME", "frontend")
+    query = ("?" + urllib.parse.urlencode(params)) if params else ""
+    return RedirectResponse(f"{scheme}://{path}{query}")
+
+
+# ---- low-level Gmail HTTP with revoke handling ----
+async def _gmail_request(account: dict, method: str, path: str, **kwargs) -> httpx.Response:
+    token = await _gmail_access_token(account)
+    headers = kwargs.pop("headers", {})
+    headers["Authorization"] = f"Bearer {token}"
+    async with httpx.AsyncClient(timeout=40) as client:
+        resp = await client.request(method, GMAIL_API + path, headers=headers, **kwargs)
+    if resp.status_code in (401, 403):
+        await _mark_revoked(account)
+        raise HTTPException(401, "Gmail access was revoked. Please reconnect your Google account.")
+    return resp
+
+
+def _b64url_decode(data: str) -> bytes:
+    if not data:
+        return b""
+    return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+
+
+def _html_to_text(html: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", html or "")
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"&amp;", "&", text)
+    text = re.sub(r"&lt;", "<", text).replace("&gt;", ">").replace("&quot;", '"').replace("&#39;", "'")
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _parse_parts(payload: dict):
+    text_parts, html_parts, attachments = [], [], []
+
+    def walk(part):
+        mime = part.get("mimeType", "")
+        body = part.get("body", {})
+        filename = part.get("filename") or ""
+        if part.get("parts"):
+            for p in part["parts"]:
+                walk(p)
+            return
+        data = body.get("data")
+        if filename and (body.get("attachmentId") or data):
+            attachments.append({"name": filename, "mimeType": mime, "size": body.get("size", 0),
+                                "attachmentId": body.get("attachmentId")})
+        elif mime == "text/plain" and data:
+            text_parts.append(_b64url_decode(data).decode("utf-8", "ignore"))
+        elif mime == "text/html" and data:
+            html_parts.append(_b64url_decode(data).decode("utf-8", "ignore"))
+
+    walk(payload or {})
+    return "\n".join(text_parts).strip(), "\n".join(html_parts).strip(), attachments
+
+
+def _folder_from_labels(labels: list) -> str:
+    if "TRASH" in labels:
+        return "trash"
+    if "DRAFT" in labels:
+        return "drafts"
+    if "SENT" in labels:
+        return "sent"
+    if "INBOX" in labels:
+        return "inbox"
+    return "archive"
+
+
+def _gmail_label(aiLabel: str) -> str:
+    return aiLabel
+
+
+def _email_doc(uid: str, msg: dict) -> dict:
+    payload = msg.get("payload", {})
+    headers = {h["name"].lower(): h["value"] for h in payload.get("headers", [])}
+    labels = msg.get("labelIds", [])
+    text, html, attachments = _parse_parts(payload)
+    from_name, from_email = parseaddr(headers.get("from", ""))
+    internal = msg.get("internalDate")
     try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get("https://oauth2.googleapis.com/tokeninfo", params={"id_token": body.id_token})
-        if response.status_code >= 400 or response.json().get("aud") != GOOGLE_CLIENT_ID:
-            raise HTTPException(401, "Google sign-in could not be verified. Please try again.")
-        info = response.json()
-    except HTTPException:
-        raise
-    except httpx.RequestError:
-        raise HTTPException(503, "Google sign-in is temporarily unavailable.")
-    email = info.get("email", "").lower()
-    if not email or info.get("email_verified") != "true":
-        raise HTTPException(400, "Your Google account email must be verified.")
-    existing = await db.users.find_one({"email": email})
-    if body.choice == "keep_gmail":
-        if not existing:
-            raise HTTPException(409, "No Fmail identity is linked to this Gmail yet. Choose Create a new Fmail account first.")
-        existing.pop("password", None); existing.pop("_id", None)
-        return {"token": make_token(existing["id"]), "user": existing, "choice": body.choice}
+        created = datetime.fromtimestamp(int(internal) / 1000, timezone.utc).isoformat() if internal else now_iso()
+    except Exception:
+        created = now_iso()
+    body_plain = text or _html_to_text(html)
+    return {
+        "id": new_id(), "threadId": msg.get("threadId", new_id()), "uid": uid,
+        "providerMessageId": msg["id"], "messageIdHeader": headers.get("message-id", ""),
+        "references": headers.get("references", "") or headers.get("message-id", ""),
+        "subject": headers.get("subject", "(no subject)"),
+        "sender": from_name or from_email or "Unknown sender", "senderEmail": from_email,
+        "to": headers.get("to", ""), "cc": headers.get("cc", ""), "bcc": "",
+        "account": "gmail", "category": "Work", "aiLabel": "FYI",
+        "important": "IMPORTANT" in labels, "unread": "UNREAD" in labels, "star": "STARRED" in labels,
+        "folder": _folder_from_labels(labels), "snippet": msg.get("snippet", ""),
+        "body": body_plain, "bodyHtml": html, "attachments": attachments, "labels": labels,
+        "outgoing": "SENT" in labels, "space": None, "suspicious": False, "created_at": created,
+    }
+
+
+async def _upsert_email(uid: str, msg: dict) -> dict:
+    doc = _email_doc(uid, msg)
+    existing = await db.emails.find_one({"uid": uid, "providerMessageId": doc["providerMessageId"]}, {"_id": 0, "id": 1})
     if existing:
-        raise HTTPException(409, "A Fmail identity already exists for this Google account. Choose Keep my Gmail or sign in normally.")
-    base = re.sub(r"[^a-z0-9._-]", "", email.split("@", 1)[0].lower())[:24] or "fmailuser"
-    if await db.users.find_one({"handle": base}):
-        raise HTTPException(409, "That Google account needs a unique Fmail username. Create the identity from signup instead.")
-    uid = new_id(); name = info.get("name") or email.split("@", 1)[0]
-    user = {"id": uid, "email": email, "password": bcrypt.hashpw(secrets.token_urlsafe(32).encode(), bcrypt.gensalt()).decode(), "name": name, "handle": base, "fmail": base + "@fmails.in", "photo": info.get("picture"), "signature": "Sent with Fmail", "aliases": [], "connectedAccounts": [{"provider": "fmail", "email": base + "@fmails.in", "connected": True}, {"provider": "gmail", "email": email, "connected": True}], "permissions": {"notifications": True, "camera": False, "microphone": False, "contacts": False, "storage": False}, "aiEnabled": True, "memoryEnabled": True, "darkMode": "system", "created_at": now_iso()}
-    await db.users.insert_one(user)
-    await audit(uid, "Google Fmail identity created", email)
-    user.pop("password"); user.pop("_id", None)
-    return {"token": make_token(uid), "user": user, "choice": body.choice}
+        doc["id"] = existing["id"]
+        await db.emails.update_one(
+            {"uid": uid, "providerMessageId": doc["providerMessageId"]},
+            {"$set": {k: doc[k] for k in ("subject", "sender", "senderEmail", "to", "cc", "important",
+                                          "unread", "star", "folder", "snippet", "body", "bodyHtml",
+                                          "attachments", "labels", "messageIdHeader", "references", "outgoing")}},
+        )
+        return doc
+    await db.emails.insert_one(dict(doc))
+    doc.pop("_id", None)
+    return doc
+
+
+async def _gmail_get_message(account: dict, message_id: str, fmt: str = "full") -> Optional[dict]:
+    resp = await _gmail_request(account, "GET", f"/messages/{message_id}", params={"format": fmt})
+    if resp.status_code >= 400:
+        return None
+    return resp.json()
+
+
+async def _gmail_list_ids(account: dict, label: str, max_results: int = 25) -> list:
+    resp = await _gmail_request(account, "GET", "/messages",
+                                params={"labelIds": label, "maxResults": max_results})
+    if resp.status_code >= 400:
+        return []
+    return [m["id"] for m in resp.json().get("messages", [])]
+
+
+async def _gmail_profile(account: dict) -> dict:
+    resp = await _gmail_request(account, "GET", "/profile")
+    return resp.json() if resp.status_code < 400 else {}
+
+
+async def _sync_gmail_account(account: dict, notify: bool = True) -> int:
+    """Incremental when a historyId exists, otherwise a bounded first sync. Returns # of new inbox mails."""
+    uid = account["uid"]
+    new_count = 0
+    hist = account.get("history_id")
+    if not hist:
+        for label in ["INBOX", "SENT", "DRAFT", "TRASH"]:
+            for mid in await _gmail_list_ids(account, label, 30):
+                msg = await _gmail_get_message(account, mid)
+                if msg:
+                    await _upsert_email(uid, msg)
+        profile = await _gmail_profile(account)
+        if profile.get("historyId"):
+            await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"history_id": str(profile["historyId"])}})
+        return 0  # never notify on the first full sync
+    resp = await _gmail_request(account, "GET", "/history", params={
+        "startHistoryId": hist, "historyTypes": ["messageAdded", "labelAdded", "labelRemoved"], "maxResults": 500})
+    if resp.status_code == 404:
+        # history too old — reset and do a full resync next time
+        await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"history_id": None}})
+        return 0
+    if resp.status_code >= 400:
+        return 0
+    data = resp.json()
+    touched = set()
+    for h in data.get("history", []):
+        for key in ("messagesAdded", "labelsAdded", "labelsRemoved", "messages"):
+            for item in h.get(key, []):
+                mid = (item.get("message") or item).get("id")
+                if mid:
+                    touched.add(mid)
+    for mid in touched:
+        msg = await _gmail_get_message(account, mid)
+        if not msg:
+            continue
+        existing = await db.emails.find_one({"uid": uid, "providerMessageId": mid}, {"_id": 0, "id": 1})
+        doc = await _upsert_email(uid, msg)
+        if not existing and doc["folder"] == "inbox" and doc["unread"] and not doc["outgoing"]:
+            new_count += 1
+            if notify:
+                await _notify_new_email(uid, doc["subject"], doc["sender"], doc["threadId"], doc["providerMessageId"])
+    if data.get("historyId"):
+        await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"history_id": str(data["historyId"])}})
+    return new_count
+
+
+# ---- Gmail send / modify helpers ----
+def _build_raw(from_addr: str, body: "ComposeIn", in_reply_to: str = "", references: str = "") -> str:
+    msg = EmailMessage()
+    msg["From"] = from_addr
+    msg["To"] = body.to
+    if body.cc:
+        msg["Cc"] = body.cc
+    if body.bcc:
+        msg["Bcc"] = body.bcc
+    msg["Subject"] = body.subject or "(no subject)"
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = (references or in_reply_to)
+    msg.set_content(body.body or "")
+    for att in (body.attachments or []):
+        raw = att.get("data") or ""
+        if "," in raw and raw.strip().startswith("data:"):
+            raw = raw.split(",", 1)[1]
+        try:
+            blob = base64.b64decode(raw)
+        except Exception:
+            continue
+        mime = att.get("type") or "application/octet-stream"
+        maintype, _, subtype = mime.partition("/")
+        msg.add_attachment(blob, maintype=maintype or "application", subtype=subtype or "octet-stream",
+                           filename=att.get("name", "attachment"))
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode()
+
+
+async def _gmail_send_raw(account: dict, raw: str, thread_id: Optional[str]) -> dict:
+    payload = {"raw": raw}
+    if thread_id:
+        payload["threadId"] = thread_id
+    resp = await _gmail_request(account, "POST", "/messages/send", json=payload)
+    if resp.status_code >= 400:
+        logger.warning("Gmail send failed %s: %s", resp.status_code, resp.text[:200])
+        raise HTTPException(502, "Your email could not be sent through Gmail. Please try again.")
+    return resp.json()
+
+
+async def _gmail_modify(account: dict, message_id: str, add: list = None, remove: list = None) -> None:
+    await _gmail_request(account, "POST", f"/messages/{message_id}/modify",
+                         json={"addLabelIds": add or [], "removeLabelIds": remove or []})
+
+
+async def _primary_account(uid: str) -> Optional[dict]:
+    acct = await db.gmail_accounts.find_one({"uid": uid}, {"_id": 0})
+    if acct and not acct.get("revoked"):
+        return acct
+    return None
+
+
+@api.get("/auth/google/login-url")
+async def google_login_url():
+    """Public: start the Sign in + Connect Gmail flow in a single OAuth grant."""
+    if not _google_ready():
+        raise HTTPException(503, "Google sign-in is not configured for this Fmail project.")
+    state = secrets.token_urlsafe(32)
+    await db.oauth_states.insert_one({"state": state, "uid": None, "purpose": "login",
+                                      "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()})
+    params = {"client_id": GOOGLE_CLIENT_ID, "redirect_uri": GOOGLE_REDIRECT_URI, "response_type": "code",
+              "access_type": "offline", "prompt": "consent", "include_granted_scopes": "true",
+              "scope": GMAIL_SCOPE, "state": state}
+    return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)}
+
+
+@api.post("/auth/google/exchange")
+async def google_exchange(body: dict):
+    """Public: trade the one-time code from the login redirect for a Fmail session."""
+    code = (body or {}).get("code")
+    rec = await db.auth_codes.find_one({"code": code}) if code else None
+    if rec:
+        await db.auth_codes.delete_one({"code": code})
+    if not rec or datetime.now(timezone.utc) > datetime.fromisoformat(rec["expires_at"]):
+        raise HTTPException(400, "This sign-in link has expired. Please try again.")
+    user = await db.users.find_one({"id": rec["uid"]}, {"_id": 0, "password": 0})
+    if not user:
+        raise HTTPException(404, "Account not found.")
+    acct = await db.gmail_accounts.find_one({"uid": user["id"]}, {"_id": 0, "email": 1})
+    user["gmailConnected"] = bool(acct)
+    user["gmailEmail"] = acct["email"] if acct else None
+    return {"token": make_token(user["id"]), "user": user}
 
 
 @api.get("/auth/google/authorize")
 async def google_authorize(user: dict = Depends(current_user)):
+    """Authenticated: connect/refresh Gmail for the signed-in Fmail account."""
     if not _google_ready():
         raise HTTPException(503, "Google integration is not configured for this Fmail project.")
     state = secrets.token_urlsafe(32)
-    await db.oauth_states.insert_one({"state": state, "uid": user["id"], "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()})
-    params = {"client_id": GOOGLE_CLIENT_ID, "redirect_uri": GOOGLE_REDIRECT_URI, "response_type": "code", "access_type": "offline", "prompt": "consent", "scope": "openid email profile https://www.googleapis.com/auth/gmail.modify", "state": state}
+    await db.oauth_states.insert_one({"state": state, "uid": user["id"], "purpose": "connect",
+                                      "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()})
+    params = {"client_id": GOOGLE_CLIENT_ID, "redirect_uri": GOOGLE_REDIRECT_URI, "response_type": "code",
+              "access_type": "offline", "prompt": "consent", "include_granted_scopes": "true",
+              "scope": GMAIL_SCOPE, "state": state}
     return {"url": "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)}
 
 
 @api.get("/auth/google/callback")
 async def google_callback(code: Optional[str] = None, state: Optional[str] = None, error: Optional[str] = None):
     if error or not code or not state:
-        return RedirectResponse((os.environ.get("EXPO_APP_SCHEME", "frontend") + "://gmail?error=cancelled"))
+        return _app_redirect("gmail", error="cancelled")
     saved = await db.oauth_states.find_one({"state": state})
     await db.oauth_states.delete_one({"state": state})
     if not saved or datetime.now(timezone.utc) > datetime.fromisoformat(saved["expires_at"]):
-        return RedirectResponse((os.environ.get("EXPO_APP_SCHEME", "frontend") + "://gmail?error=expired"))
+        return _app_redirect("gmail", error="expired")
+    purpose = saved.get("purpose", "connect")
     try:
-        tokens = await _google_tokens(code); info = await _google_userinfo(tokens["access_token"]); encrypted = _fernet()
-        account = {"id": new_id(), "uid": saved["uid"], "email": info["email"].lower(), "access_token": encrypted.encrypt(tokens["access_token"].encode()).decode(), "refresh_token": encrypted.encrypt(tokens.get("refresh_token", "").encode()).decode(), "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(tokens.get("expires_in", 3600)))).isoformat(), "history_id": None, "created_at": now_iso()}
-        await db.gmail_accounts.update_one({"uid": saved["uid"], "email": account["email"]}, {"$set": account}, upsert=True)
-        await db.users.update_one({"id": saved["uid"]}, {"$set": {"connectedAccounts.gmail": {"provider": "gmail", "email": account["email"], "connected": True}}})
-        return RedirectResponse((os.environ.get("EXPO_APP_SCHEME", "frontend") + "://gmail?connected=1"))
+        tokens = await _google_tokens(code)
+        info = await _google_userinfo(tokens["access_token"])
+        if not info.get("email") or info.get("email_verified") not in (True, "true"):
+            return _app_redirect("gmail", error="unverified")
+        email = info["email"].lower()
+        if purpose == "login":
+            uid_user = await db.users.find_one({"email": email})
+            if not uid_user:
+                uid = new_id()
+                uid_user = {
+                    "id": uid, "email": email,
+                    "password": bcrypt.hashpw(secrets.token_urlsafe(32).encode(), bcrypt.gensalt()).decode(),
+                    "name": info.get("name") or email.split("@", 1)[0], "photo": info.get("picture"),
+                    "signature": "Sent with Fmail", "aliases": [],
+                    "connectedAccounts": [{"provider": "gmail", "email": email, "connected": True}],
+                    "permissions": {"notifications": True, "camera": False, "microphone": False, "contacts": False, "storage": False},
+                    "aiEnabled": True, "memoryEnabled": True, "darkMode": "system", "created_at": now_iso(),
+                }
+                await db.users.insert_one(uid_user)
+                await audit(uid, "Account created via Google", email)
+            else:
+                uid = uid_user["id"]
+            await _store_gmail_account(uid, info, tokens)
+            one_time = secrets.token_urlsafe(32)
+            await db.auth_codes.insert_one({"code": one_time, "uid": uid,
+                                            "expires_at": (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()})
+            return _app_redirect("auth", code=one_time)
+        # connect for an already signed-in account
+        await _store_gmail_account(saved["uid"], info, tokens)
+        await audit(saved["uid"], "Gmail connected", email)
+        return _app_redirect("gmail", connected="1")
     except HTTPException:
-        return RedirectResponse((os.environ.get("EXPO_APP_SCHEME", "frontend") + "://gmail?error=failed"))
+        return _app_redirect("gmail", error="failed")
+    except Exception as exc:
+        logger.warning("Google callback failed: %s", type(exc).__name__)
+        return _app_redirect("gmail", error="failed")
 
 
 @api.post("/auth/google/connect")
@@ -821,18 +1123,18 @@ async def google_connect(body: GoogleConnectIn, user: dict = Depends(current_use
     info = await _google_userinfo(tokens["access_token"])
     if not info.get("email") or not info.get("email_verified"):
         raise HTTPException(400, "The Google account email must be verified.")
-    encrypted = _fernet()
-    account = {
-        "id": new_id(), "uid": user["id"], "email": info["email"].lower(),
-        "access_token": encrypted.encrypt(tokens["access_token"].encode()).decode(),
-        "refresh_token": encrypted.encrypt(tokens.get("refresh_token", "").encode()).decode(),
-        "expires_at": (datetime.now(timezone.utc) + timedelta(seconds=int(tokens.get("expires_in", 3600)))).isoformat(),
-        "history_id": None, "created_at": now_iso(),
-    }
-    await db.gmail_accounts.update_one({"uid": user["id"], "email": account["email"]}, {"$set": account}, upsert=True)
-    await db.users.update_one({"id": user["id"]}, {"$set": {"connectedAccounts.gmail": {"provider": "gmail", "email": account["email"], "connected": True}}})
+    account = await _store_gmail_account(user["id"], info, tokens)
     await audit(user["id"], "Gmail connected", account["email"])
     return {"connected": True, "email": account["email"]}
+
+
+@api.post("/auth/google/disconnect")
+async def google_disconnect(user: dict = Depends(current_user)):
+    await db.gmail_accounts.delete_many({"uid": user["id"]})
+    await db.emails.delete_many({"uid": user["id"], "account": "gmail"})
+    await db.users.update_one({"id": user["id"]}, {"$set": {"connectedAccounts": [{"provider": "gmail", "email": "", "connected": False}]}})
+    await audit(user["id"], "Gmail disconnected", user["email"])
+    return {"connected": False}
 
 
 @api.post("/push/register")
@@ -868,48 +1170,86 @@ async def _firebase_access_token() -> Optional[str]:
         return None
 
 
-async def _notify_new_email(uid: str, subject: str, sender: str) -> None:
+async def _notify_new_email(uid: str, subject: str, sender: str, thread_id: str = "", message_id: str = "") -> None:
     access = await _firebase_access_token()
     if not access:
         return
     tokens = await db.push_tokens.find({"uid": uid}, {"_id": 0, "token": 1}).to_list(100)
+    data = {"type": "new_email", "threadId": thread_id or "", "messageId": message_id or ""}
     async with httpx.AsyncClient(timeout=20) as client:
         for row in tokens:
-            response = await client.post(f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send", headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"}, json={"message": {"token": row["token"], "notification": {"title": sender or "New email", "body": subject or "You received a new email"}, "data": {"type": "new_email"}}})
+            response = await client.post(
+                f"https://fcm.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/messages:send",
+                headers={"Authorization": f"Bearer {access}", "Content-Type": "application/json"},
+                json={"message": {
+                    "token": row["token"],
+                    "notification": {"title": sender or "New email", "body": subject or "You received a new email"},
+                    "data": data,
+                    "android": {"priority": "high", "notification": {"channel_id": "fmail_mail", "click_action": "OPEN_THREAD"}},
+                    "apns": {"payload": {"aps": {"sound": "default", "category": "OPEN_THREAD"}}},
+                }})
             if response.status_code in (404, 410):
                 await db.push_tokens.delete_one({"uid": uid, "token": row["token"]})
 
 
 @api.post("/gmail/sync")
 async def gmail_sync(user: dict = Depends(current_user)):
-    accounts = await db.gmail_accounts.find({"uid": user["id"]}, {"_id": 0}).to_list(20)
+    accounts = await db.gmail_accounts.find({"uid": user["id"], "revoked": {"$ne": True}}, {"_id": 0}).to_list(20)
     if not accounts:
         raise HTTPException(400, "Connect a Google account before syncing Gmail.")
     imported = 0
     for account in accounts:
-        token = await _gmail_access_token(account)
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.get("https://gmail.googleapis.com/gmail/v1/users/me/messages", headers={"Authorization": f"Bearer {token}"}, params={"q": "in:inbox newer_than:2d", "maxResults": 100})
-        if response.status_code in (401, 403):
-            raise HTTPException(401, "Gmail access was revoked. Please reconnect Google.")
-        if response.status_code >= 400:
-            raise HTTPException(502, "Gmail could not be synchronized. Please retry.")
-        message_ids = [m["id"] for m in response.json().get("messages", [])]
-        for message_id in message_ids:
-            if await db.emails.find_one({"uid": user["id"], "providerMessageId": message_id}):
-                continue
-            async with httpx.AsyncClient(timeout=30) as client:
-                detail = await client.get(f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{message_id}", headers={"Authorization": f"Bearer {token}"}, params={"format": "metadata", "metadataHeaders": ["Subject", "From", "Date"]})
-            if detail.status_code >= 400:
-                continue
-            payload = detail.json(); headers = {h["name"].lower(): h["value"] for h in payload.get("payload", {}).get("headers", [])}
-            sender = headers.get("from", "Unknown sender")
-            subject = headers.get("subject", "(no subject)")
-            doc = {"id": new_id(), "threadId": payload.get("threadId", new_id()), "uid": user["id"], "providerMessageId": message_id, "subject": subject, "sender": sender, "senderEmail": sender, "to": user["fmail"], "account": "gmail", "category": "Work", "aiLabel": "FYI", "important": False, "unread": True, "star": False, "folder": "inbox", "snippet": payload.get("snippet", ""), "body": payload.get("snippet", ""), "created_at": now_iso(), "outgoing": False}
-            await db.emails.insert_one(doc); imported += 1
-            await _notify_new_email(user["id"], subject, sender)
-    await audit(user["id"], "Gmail synchronized", f"Imported {imported} new emails")
-    return {"imported": imported}
+        imported += await _sync_gmail_account(account, notify=True)
+    await audit(user["id"], "Gmail synchronized", f"{imported} new email(s)")
+    return {"imported": imported, "ok": True}
+
+
+@api.get("/gmail/status")
+async def gmail_status(user: dict = Depends(current_user)):
+    acct = await db.gmail_accounts.find_one({"uid": user["id"]}, {"_id": 0, "email": 1, "revoked": 1, "history_id": 1})
+    return {"connected": bool(acct) and not (acct or {}).get("revoked", False),
+            "email": (acct or {}).get("email"), "needsReconnect": bool(acct) and (acct or {}).get("revoked", False)}
+
+
+@api.post("/gmail/watch")
+async def gmail_watch(user: dict = Depends(current_user)):
+    """Register Gmail push via Cloud Pub/Sub (requires GMAIL_PUBSUB_TOPIC configured in GCP)."""
+    topic = os.environ.get("GMAIL_PUBSUB_TOPIC")
+    if not topic:
+        raise HTTPException(503, "Real-time Gmail push is not configured. Server-side polling is active instead.")
+    account = await _primary_account(user["id"])
+    if not account:
+        raise HTTPException(400, "Connect a Google account first.")
+    resp = await _gmail_request(account, "POST", "/watch", json={"topicName": topic, "labelIds": ["INBOX"]})
+    if resp.status_code >= 400:
+        raise HTTPException(502, "Could not enable Gmail push notifications.")
+    data = resp.json()
+    await db.gmail_accounts.update_one({"id": account["id"]}, {"$set": {"watch_expiration": data.get("expiration"), "history_id": str(data.get("historyId"))}})
+    return {"watching": True, "expiration": data.get("expiration")}
+
+
+@api.post("/gmail/push")
+async def gmail_push(request: Request):
+    """Public webhook for Google Cloud Pub/Sub push of Gmail changes."""
+    token_q = request.query_params.get("token")
+    expected = os.environ.get("GMAIL_PUSH_TOKEN")
+    if expected and token_q != expected:
+        raise HTTPException(403, "Invalid push token.")
+    try:
+        envelope = await request.json()
+        raw = envelope.get("message", {}).get("data", "")
+        decoded = json.loads(_b64url_decode(raw).decode("utf-8")) if raw else {}
+        email = (decoded.get("emailAddress") or "").lower()
+    except Exception:
+        return {"ok": True}
+    if email:
+        account = await db.gmail_accounts.find_one({"email": email, "revoked": {"$ne": True}}, {"_id": 0})
+        if account:
+            try:
+                await _sync_gmail_account(account, notify=True)
+            except Exception as exc:
+                logger.warning("Pub/Sub sync failed: %s", type(exc).__name__)
+    return {"ok": True}
 
 
 @api.post("/analytics")
@@ -973,22 +1313,101 @@ async def get_thread(tid: str, user: dict = Depends(current_user)):
     if not msgs:
         raise HTTPException(404, "Thread not found")
     await db.emails.update_many({"uid": user["id"], "threadId": tid}, {"$set": {"unread": False}})
+    # Mark read in Gmail too.
+    account = await _primary_account(user["id"])
+    if account:
+        for m in msgs:
+            if m.get("providerMessageId") and m.get("unread"):
+                try:
+                    await _gmail_modify(account, m["providerMessageId"], remove=["UNREAD"])
+                except Exception:
+                    pass
     return {"threadId": tid, "subject": msgs[0]["subject"], "messages": msgs}
+
+
+@api.get("/emails/{mid}/attachment/{attachment_id}")
+async def get_attachment(mid: str, attachment_id: str, user: dict = Depends(current_user)):
+    """Fetch an attachment's base64 content from Gmail on demand."""
+    email = await db.emails.find_one({"uid": user["id"], "providerMessageId": mid}, {"_id": 0})
+    account = await _primary_account(user["id"])
+    if not email or not account:
+        raise HTTPException(404, "Attachment is no longer available.")
+    resp = await _gmail_request(account, "GET", f"/messages/{mid}/attachments/{attachment_id}")
+    if resp.status_code >= 400:
+        raise HTTPException(404, "Attachment could not be downloaded.")
+    raw = resp.json().get("data", "")
+    att = next((a for a in email.get("attachments", []) if a.get("attachmentId") == attachment_id), {})
+    # Gmail returns base64url; convert to standard base64 for the client.
+    std = base64.b64encode(_b64url_decode(raw)).decode()
+    return {"name": att.get("name", "attachment"), "type": att.get("mimeType", "application/octet-stream"), "data": std}
 
 
 @api.post("/emails/compose")
 async def compose(body: ComposeIn, user: dict = Depends(current_user)):
+    account = await _primary_account(user["id"])
+    # --- Real Gmail send / draft ---
+    if account:
+        in_reply_to = references = ""
+        thread_gmail = None
+        provider_draft_id = None
+        if body.threadId:
+            last = await db.emails.find({"uid": user["id"], "threadId": body.threadId}, {"_id": 0}).sort("created_at", -1).to_list(1)
+            if last:
+                in_reply_to = last[0].get("messageIdHeader", "")
+                references = last[0].get("references", "") or in_reply_to
+                thread_gmail = last[0].get("threadId")
+        if body.draftId:
+            old = await db.emails.find_one({"uid": user["id"], "id": body.draftId}, {"_id": 0})
+            if old:
+                provider_draft_id = old.get("providerDraftId")
+                thread_gmail = thread_gmail or old.get("threadId")
+        raw = _build_raw(account["email"], body, in_reply_to, references)
+        if body.draft:
+            payload = {"message": {"raw": raw}}
+            if thread_gmail:
+                payload["message"]["threadId"] = thread_gmail
+            if provider_draft_id:
+                resp = await _gmail_request(account, "PUT", f"/drafts/{provider_draft_id}", json=payload)
+            else:
+                resp = await _gmail_request(account, "POST", "/drafts", json=payload)
+            if resp.status_code >= 400:
+                raise HTTPException(502, "Your draft could not be saved to Gmail. Please try again.")
+            draft = resp.json()
+            msg = await _gmail_get_message(account, draft["message"]["id"])
+            if body.draftId:
+                await db.emails.delete_one({"uid": user["id"], "id": body.draftId})
+            doc = await _upsert_email(user["id"], msg) if msg else None
+            if doc:
+                await db.emails.update_one({"uid": user["id"], "providerMessageId": doc["providerMessageId"]},
+                                           {"$set": {"providerDraftId": draft["id"]}})
+                doc["providerDraftId"] = draft["id"]
+            await audit(user["id"], "Draft saved", f"To {body.to}: {body.subject}")
+            return doc or {"ok": True}
+        # send
+        sent = await _gmail_send_raw(account, raw, thread_gmail)
+        if body.draftId:
+            old = await db.emails.find_one({"uid": user["id"], "id": body.draftId}, {"_id": 0})
+            if old and old.get("providerDraftId"):
+                try:
+                    await _gmail_request(account, "DELETE", f"/drafts/{old['providerDraftId']}")
+                except Exception:
+                    pass
+            await db.emails.delete_one({"uid": user["id"], "id": body.draftId})
+        msg = await _gmail_get_message(account, sent["id"])
+        doc = await _upsert_email(user["id"], msg) if msg else None
+        await audit(user["id"], "Email sent", f"To {body.to}: {body.subject}")
+        return doc or {"ok": True, "threadId": sent.get("threadId")}
+    # --- Local fallback (accounts without Gmail connected, e.g. demo) ---
     tid = body.threadId or new_id()
-    # Updating an existing draft? remove the old draft doc first.
     if body.draftId:
         await db.emails.delete_one({"uid": user["id"], "id": body.draftId, "folder": "drafts"})
     doc = {
         "id": new_id(), "threadId": tid, "uid": user["id"], "subject": body.subject,
-        "sender": user["name"], "senderEmail": user["fmail"], "to": body.to,
+        "sender": user["name"], "senderEmail": _user_addr(user), "to": body.to,
         "cc": body.cc or "", "bcc": body.bcc or "", "attachments": body.attachments or [],
         "account": body.account, "category": "Work", "aiLabel": "FYI", "important": False,
         "unread": False, "star": False, "folder": "drafts" if body.draft else "sent",
-        "snippet": (body.body or "")[:120], "body": body.body, "suspicious": False, "space": None,
+        "snippet": (body.body or "")[:120], "body": body.body, "bodyHtml": "", "suspicious": False, "space": None,
         "outgoing": True, "created_at": now_iso(),
     }
     await db.emails.insert_one(doc)
@@ -999,11 +1418,25 @@ async def compose(body: ComposeIn, user: dict = Depends(current_user)):
 
 @api.delete("/emails/{tid}")
 async def delete_email(tid: str, user: dict = Depends(current_user)):
-    """Move a thread to trash; permanently delete if already in trash."""
-    existing = await db.emails.find_one({"uid": user["id"], "threadId": tid}, {"_id": 0})
-    if not existing:
+    """Move a thread to trash; permanently delete if already in trash. Mirrors to Gmail."""
+    msgs = await db.emails.find({"uid": user["id"], "threadId": tid}, {"_id": 0}).to_list(200)
+    if not msgs:
         raise HTTPException(404, "Email not found")
-    if existing.get("folder") == "trash":
+    account = await _primary_account(user["id"])
+    already_trash = msgs[0].get("folder") == "trash"
+    for m in msgs:
+        pid = m.get("providerMessageId")
+        if account and pid:
+            try:
+                if already_trash:
+                    await _gmail_request(account, "DELETE", f"/messages/{pid}")
+                elif m.get("providerDraftId"):
+                    await _gmail_request(account, "DELETE", f"/drafts/{m['providerDraftId']}")
+                else:
+                    await _gmail_request(account, "POST", f"/messages/{pid}/trash")
+            except Exception:
+                pass
+    if already_trash:
         await db.emails.delete_many({"uid": user["id"], "threadId": tid})
     else:
         await db.emails.update_many({"uid": user["id"], "threadId": tid}, {"$set": {"folder": "trash"}})
@@ -1013,8 +1446,32 @@ async def delete_email(tid: str, user: dict = Depends(current_user)):
 @api.patch("/emails/{tid}")
 async def patch_email(tid: str, body: PatchEmailIn, user: dict = Depends(current_user)):
     updates = {k: v for k, v in body.dict().items() if v is not None}
-    if updates:
-        await db.emails.update_many({"uid": user["id"], "threadId": tid}, {"$set": updates})
+    if not updates:
+        return {"ok": True}
+    msgs = await db.emails.find({"uid": user["id"], "threadId": tid}, {"_id": 0}).to_list(200)
+    account = await _primary_account(user["id"])
+    if account and msgs:
+        add, remove = [], []
+        if "star" in updates:
+            (add if updates["star"] else remove).append("STARRED")
+        if "important" in updates:
+            (add if updates["important"] else remove).append("IMPORTANT")
+        if "read" in updates:
+            (remove if updates["read"] else add).append("UNREAD")
+        if "folder" in updates and updates["folder"] == "trash":
+            add.append("TRASH"); remove.append("INBOX")
+        if add or remove:
+            for m in msgs:
+                if m.get("providerMessageId"):
+                    try:
+                        await _gmail_modify(account, m["providerMessageId"], add=add, remove=remove)
+                    except Exception:
+                        pass
+    # local mirror (map read -> unread flag)
+    local = dict(updates)
+    if "read" in local:
+        local["unread"] = not local.pop("read")
+    await db.emails.update_many({"uid": user["id"], "threadId": tid}, {"$set": local})
     return {"ok": True, **updates}
 
 
@@ -1619,6 +2076,20 @@ async def search(q: str, user: dict = Depends(current_user)):
     def match(text):
         return ql in (text or "").lower()
 
+    # Pull live Gmail search results into the cache so search reflects the full mailbox.
+    account = await _primary_account(uid)
+    if account and q.strip():
+        try:
+            resp = await _gmail_request(account, "GET", "/messages", params={"q": q, "maxResults": 20})
+            if resp.status_code < 400:
+                for m in resp.json().get("messages", []):
+                    if not await db.emails.find_one({"uid": uid, "providerMessageId": m["id"]}, {"_id": 0, "id": 1}):
+                        full = await _gmail_get_message(account, m["id"])
+                        if full:
+                            await _upsert_email(uid, full)
+        except Exception as exc:
+            logger.warning("Gmail search failed: %s", type(exc).__name__)
+
     emails = await db.emails.find({"uid": uid}, {"_id": 0}).to_list(500)
     tasks = await db.tasks.find({"uid": uid}, {"_id": 0}).to_list(300)
     events = await db.events.find({"uid": uid}, {"_id": 0}).to_list(300)
@@ -1627,7 +2098,7 @@ async def search(q: str, user: dict = Depends(current_user)):
     memory = await db.memory.find({"uid": uid}, {"_id": 0}).to_list(300)
     decisions = await db.decisions.find({"uid": uid}, {"_id": 0}).to_list(200)
     return {
-        "emails": [e for e in emails if match(e["subject"]) or match(e["snippet"]) or match(e["sender"])][:20],
+        "emails": [e for e in emails if match(e.get("subject")) or match(e.get("snippet")) or match(e.get("sender")) or match(e.get("body"))][:20],
         "tasks": [t for t in tasks if match(t["title"])][:20],
         "events": [e for e in events if match(e["title"])][:20],
         "meetings": [m for m in meetings if match(m["title"])][:20],
@@ -1648,19 +2119,20 @@ gmail_task = None
 @app.on_event("startup")
 async def startup():
     global gmail_task
+
     async def poll():
         while True:
             try:
-                users = await db.gmail_accounts.distinct("uid")
-                for uid in users:
+                accounts = await db.gmail_accounts.find({"revoked": {"$ne": True}}, {"_id": 0}).to_list(500)
+                for account in accounts:
                     try:
-                        user = await db.users.find_one({"id": uid}, {"_id": 0})
-                        if user: await gmail_sync(user)
+                        await _sync_gmail_account(account, notify=True)
                     except Exception as exc:
-                        logger.warning("Gmail background sync failed for user %s: %s", uid, type(exc).__name__)
+                        logger.warning("Gmail background sync failed for %s: %s", account.get("email"), type(exc).__name__)
             except Exception as exc:
                 logger.warning("Gmail background poll failed: %s", type(exc).__name__)
-            await asyncio.sleep(60)
+            await asyncio.sleep(45)
+
     gmail_task = asyncio.create_task(poll())
 
 

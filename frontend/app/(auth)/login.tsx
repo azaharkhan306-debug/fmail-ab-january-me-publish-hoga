@@ -1,10 +1,8 @@
 import React, { useState } from "react";
-import { View, Text, Pressable, Alert, Platform } from "react-native";
+import { View, Text, Pressable, Alert } from "react-native";
 import { KeyboardAwareScrollView } from "react-native-keyboard-controller";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useRouter } from "expo-router";
-import { api, setToken } from "@/src/api";
-import { track } from "@/src/analytics";
 import { useAuth } from "@/src/auth";
 import { useTheme, spacing } from "@/src/theme";
 import { Icon, Button, Field, T } from "@/src/ui";
@@ -12,11 +10,12 @@ import { Icon, Button, Field, T } from "@/src/ui";
 export default function Login() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
-  const { login } = useAuth();
+  const { login, loginWithGoogle } = useAuth();
   const { colors } = useTheme();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
   const [error, setError] = useState("");
 
   const onLogin = async () => {
@@ -33,12 +32,32 @@ export default function Login() {
     }
   };
 
+  const onGoogle = async () => {
+    setError("");
+    setGoogleLoading(true);
+    try {
+      await loginWithGoogle();
+      router.replace("/(tabs)");
+    } catch (e: any) {
+      setError(e?.message || "Google sign-in failed. Please try again.");
+    } finally {
+      setGoogleLoading(false);
+    }
+  };
+
   return (
     <View style={{ flex: 1, backgroundColor: colors.surface }}>
       <KeyboardAwareScrollView contentContainerStyle={{ paddingTop: insets.top + 20, paddingBottom: 40, paddingHorizontal: spacing.xl }} bottomOffset={20}>
         <Pressable onPress={() => router.back()} style={{ marginBottom: 20 }}><Icon name="arrow-left" size={26} /></Pressable>
         <Text style={{ fontSize: 30, fontWeight: "900", color: colors.onSurface, letterSpacing: -0.5 }}>Welcome back</Text>
         <T size={15} color={colors.muted} style={{ marginTop: 6, marginBottom: 28 }}>Sign in to your Fmail account</T>
+
+        <Button title="Continue with Google" icon="google" testID="google-signin" loading={googleLoading} onPress={onGoogle} />
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 10, marginVertical: 20 }}>
+          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
+          <T size={12} color={colors.muted}>or sign in with email</T>
+          <View style={{ flex: 1, height: 1, backgroundColor: colors.border }} />
+        </View>
 
         <View style={{ gap: 12 }}>
           <Field icon="email-outline" placeholder="Email" value={email} onChangeText={setEmail} keyboardType="email-address" autoCapitalize="none" testID="login-email" />
@@ -48,31 +67,15 @@ export default function Login() {
         {error ? <Text style={{ color: colors.error, marginTop: 12 }} testID="login-error">{error}</Text> : null}
 
         <Button title="Sign in" onPress={onLogin} loading={loading} testID="login-submit" style={{ marginTop: 24 }} />
-        <GoogleAuthButton />
 
         <Pressable onPress={() => router.push("/(auth)/forgot")} style={{ marginTop: 16, alignItems: "center" }} testID="go-forgot">
           <T color={colors.brandPrimary} weight="700">Forgot password?</T>
         </Pressable>
 
         <Pressable onPress={() => router.replace("/(auth)/signup")} style={{ marginTop: 16, alignItems: "center" }} testID="go-signup">
-          <T color={colors.muted}>New to Fmail? <Text style={{ color: colors.brandPrimary, fontWeight: "700" }}>Create identity</Text></T>
+          <T color={colors.muted}>New to Fmail? <Text style={{ color: colors.brandPrimary, fontWeight: "700" }}>Create an account</Text></T>
         </Pressable>
       </KeyboardAwareScrollView>
     </View>
-  );
-}
-
-function GoogleAuthButton() {
-  // Google sign-in is not configured for this Fmail project
-  // Show safe message when clicked
-  return (
-    <Button 
-      title="Continue with Google" 
-      icon="google" 
-      variant="secondary" 
-      onPress={() => Alert.alert("Google sign-in unavailable", "Google OAuth is not configured for the Fmail Firebase project yet.")} 
-      style={{ marginTop: 12 }} 
-      testID="google-signin" 
-    />
   );
 }
